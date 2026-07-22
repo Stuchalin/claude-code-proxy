@@ -228,6 +228,7 @@ curl -N http://localhost:8787/v1/messages \
 | `AUTO_REFRESH`            | no       | `true`                        | Auto-refresh the token when it expires (`false` to disable).           |
 | `BLOCKED_MODELS`          | no       | —                             | Comma-separated substrings; matching models are rejected with `403`.   |
 | `ALLOWED_MODELS`          | no       | —                             | If set, only matching models are allowed (everything else `403`).      |
+| `MAX_EFFORT`              | no       | —                             | Cap reasoning effort; requests above it get `403`. See below.          |
 | `UPSTREAM_HOST`           | no       | `api.anthropic.com`           | Upstream API host.                                                     |
 
 ### Restricting models
@@ -246,6 +247,21 @@ ALLOWED_MODELS=sonnet,haiku
 
 Blocked requests get an Anthropic-style `403` error, which the client CLI
 surfaces as a normal error message.
+
+### Capping reasoning effort
+
+The proxy also reads `output_config.effort` and can reject requests above a
+ceiling. Levels low→high are `low`, `medium`, `high`, `xhigh`, `max`.
+
+```bash
+MAX_EFFORT=high   # xhigh / max requests get 403
+```
+
+⚠️ **Claude Code defaults to `xhigh`.** With a cap below `xhigh`, your friend's
+default requests will be rejected until they lower effort on their side. If
+you'd rather the proxy silently **clamp** effort down to the ceiling (rewrite
+the request instead of rejecting it) so nothing breaks, that's a small change —
+just ask.
 
 ## Security notes
 

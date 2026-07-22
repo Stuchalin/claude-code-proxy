@@ -97,6 +97,15 @@ function parseList(v) {
 }
 const BLOCKED_MODELS = parseList(process.env.BLOCKED_MODELS);
 const ALLOWED_MODELS = parseList(process.env.ALLOWED_MODELS);
+
+// Effort cap: reject requests whose output_config.effort exceeds this ceiling.
+// Levels, lowest to highest. Claude Code defaults to "xhigh".
+const EFFORT_ORDER = { low: 1, medium: 2, high: 3, xhigh: 4, max: 5 };
+const MAX_EFFORT = (process.env.MAX_EFFORT || '').trim().toLowerCase();
+if (MAX_EFFORT && !(MAX_EFFORT in EFFORT_ORDER)) {
+  console.error(`[config] MAX_EFFORT must be one of ${Object.keys(EFFORT_ORDER).join(', ')} (got '${MAX_EFFORT}')`);
+  process.exit(1);
+}
 // Max request body we'll buffer to inspect the model (bytes). Requests larger
 // than this are rejected with 413. Generous default for image-heavy prompts.
 const MAX_REQUEST_BYTES = Number(process.env.MAX_REQUEST_BYTES || 100 * 1024 * 1024);
@@ -316,15 +325,22 @@ function readBody(req) {
   });
 }
 
-// Extract the requested model from a JSON body (returns null if not present).
-function parseModel(body, contentType) {
-  if (!body || body.length === 0) return null;
-  if (contentType && !contentType.toLowerCase().includes('json')) return null;
+// Extract the requested model and effort from a JSON body (fields may be null).
+function inspectBody(body, contentType) {
+  const empty = { model: null, effort: null };
+  if (!body || body.length === 0) return empty;
+  if (contentType && !contentType.toLowerCase().includes('json')) return empty;
   try {
     const j = JSON.parse(body.toString('utf8'));
-    return typeof j.model === 'string' ? j.model : null;
+    return {
+      model: typeof j.model === 'string' ? j.model : null,
+      effort:
+        j.output_config && typeof j.output_config.effort === 'string'
+          ? j.output_config.effort
+          : null,
+    };
   } catch {
-    return null;
+    return empty;
   }
 }
 
@@ -337,6 +353,20 @@ function modelDecision(model) {
   }
   if (BLOCKED_MODELS.some((s) => m.includes(s))) {
     return { ok: false, reason: `model '${model}' is blocked by this proxy` };
+  }
+  return { ok: true };
+}
+
+// Decide whether a request's effort level is within the configured ceiling.
+function effortDecision(effort) {
+  if (!MAX_EFFORT || !effort) return { ok: true };
+  const rank = EFFORT_ORDER[effort.toLowerCase()];
+  if (!rank) return { ok: true }; // unknown value — let upstream judge it
+  if (rank > EFFORT_ORDER[MAX_EFFORT]) {
+    return {
+      ok: false,
+      reason: `effort '${effort}' exceeds this proxy's maximum of '${MAX_EFFORT}' — lower the effort and retry`,
+    };
   }
   return { ok: true };
 }
@@ -414,10 +444,10 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // Enforce the model policy before spending a token refresh or hitting upstream.
-  const model = parseModel(body, req.headers['content-type']);
-  const decision = modelDecision(model);
-  if (!decision.ok) {
+  // Enforce the model + effort policy before spending a token refresh or hitting upstream.
+  const { model, effort } = inspectBody(body, req.headers['content-type']);
+  const decision = [modelDecision(model), effortDecision(effort)].find((d) => !d.ok);
+  if (decision) {
     console.log(`[policy] blocked ${req.method} ${req.url} -> ${decision.reason}`);
     res.writeHead(403, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ type: 'error', error: { type: 'forbidden', message: decision.reason } }));
@@ -488,6 +518,7 @@ server.listen(PORT, HOST, () => {
   console.log(`[proxy] shared-secret header: ${SECRET_HEADER}`);
   if (ALLOWED_MODELS.length) console.log(`[proxy] model allowlist: ${ALLOWED_MODELS.join(', ')}`);
   if (BLOCKED_MODELS.length) console.log(`[proxy] model blocklist: ${BLOCKED_MODELS.join(', ')}`);
+  if (MAX_EFFORT) console.log(`[proxy] max effort: ${MAX_EFFORT}`);
   if (cache.token) {
     const exp = cache.expiresAt ? ` (expires ${new Date(cache.expiresAt).toISOString()})` : '';
     console.log(`[proxy] OAuth token discovered from ${cache.source}${exp}`);
