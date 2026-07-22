@@ -95,12 +95,20 @@ small VPS), then they run their CLI against it:
 
 ```bash
 export ANTHROPIC_BASE_URL="http://YOUR_PROXY_HOST:8787"
+export ANTHROPIC_API_KEY="sk-ant-dummy"                 # any value; the proxy discards it
 export ANTHROPIC_CUSTOM_HEADERS="x-proxy-secret: the-shared-secret-you-gave-them"
 claude
 ```
 
-`ANTHROPIC_CUSTOM_HEADERS` makes the CLI attach the shared secret to every
-request. (If you changed `PROXY_SECRET_HEADER`, use that header name instead.)
+- `ANTHROPIC_BASE_URL` points the CLI at your proxy.
+- `ANTHROPIC_API_KEY` (any dummy value) puts the CLI in API-key mode so it
+  **doesn't try to run its own OAuth login** — the proxy strips this header and
+  injects your real token, so the value is irrelevant.
+- `ANTHROPIC_CUSTOM_HEADERS` attaches the shared secret to every request. (If
+  you changed `PROXY_SECRET_HEADER`, use that header name instead.)
+
+The friend does **not** need a Claude subscription or to log in — that's the
+whole point.
 
 ## Windows (PowerShell) quickstart
 
@@ -128,7 +136,8 @@ The token is picked up automatically — you should see
 **Client (your friend, also Windows):**
 
 ```powershell
-$env:ANTHROPIC_BASE_URL   = "http://YOUR_PROXY_HOST:8787"
+$env:ANTHROPIC_BASE_URL       = "http://YOUR_PROXY_HOST:8787"
+$env:ANTHROPIC_API_KEY        = "sk-ant-dummy"   # any value; proxy discards it, skips login
 $env:ANTHROPIC_CUSTOM_HEADERS = "x-proxy-secret: the-shared-secret-you-gave-them"
 claude
 ```
