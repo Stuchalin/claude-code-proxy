@@ -1,32 +1,49 @@
-# Claude Code credential proxy
+# claude-code-proxy
 
-A tiny, **zero-dependency** reverse proxy that lets a friend use *your* Claude
-subscription through their own Claude Code CLI — **without ever handing over
-your credentials or session files**.
+A tiny, **zero-dependency** self-hosted gateway that lets you use **your own**
+Claude subscription from your other devices — a headless server, a remote dev
+box, a second laptop — **without copying your credential files around**.
 
-The friend points their CLI's `ANTHROPIC_BASE_URL` at this proxy and sends a
-shared secret header. The proxy authenticates them, throws away whatever auth
-they sent, injects *your* OAuth token, and forwards everything to
+Point a Claude Code CLI's `ANTHROPIC_BASE_URL` at the proxy and give it a shared
+secret. The proxy authenticates the request, injects the OAuth token it reads
+from *your* local Claude Code login, and forwards everything to
 `api.anthropic.com`. Streamed responses (SSE) pass straight through in
-real-time.
-
-Your token is **discovered automatically** from your local Claude Code login
-and **refreshed on the fly** when it expires — so the only thing you configure
-is a shared secret to hand your friend.
+real-time. Your token stays on the one machine that hosts the proxy.
 
 ```
-┌──────────────────┐   x-proxy-secret    ┌───────────┐  Bearer <your token>  ┌──────────────────┐
-│ Friend's CLI     │ ──────────────────▶ │  proxy    │ ────────────────────▶ │ api.anthropic.com │
+┌──────────────────┐   x-proxy-secret    ┌───────────┐  Bearer <your token>  ┌───────────────────┐
+│ your other device│ ──────────────────▶ │  proxy    │ ────────────────────▶ │ api.anthropic.com │
 │ ANTHROPIC_BASE_  │ ◀────────────────── │ (this app)│ ◀──────────────────── │                   │
-│ URL=your-proxy   │    streamed SSE     └───────────┘     streamed SSE       └──────────────────┘
+│ URL=your-proxy   │    streamed SSE     └───────────┘     streamed SSE       └───────────────────┘
 └──────────────────┘
 ```
 
+## Who this is for
+
+The intended use is **your own account, on machines you control**:
+
+- Run Claude Code on a **headless / remote server** without dropping your
+  `~/.claude` credentials onto it.
+- Reach one logged-in machine from your **other devices on the same network**.
+- Keep the OAuth token on a **single trusted host** instead of syncing
+  credential files between computers.
+
+> **Responsible use — please read.** This tool forwards *your* Anthropic
+> credentials, so every request it serves counts as your usage and is your
+> responsibility. Before pointing anyone else's device at it, check Anthropic's
+> [Terms of Service](https://www.anthropic.com/legal/consumer-terms) and
+> [Usage Policy](https://www.anthropic.com/legal/aup) — individual
+> subscriptions are generally intended for a single person, and sharing account
+> access may not be permitted under your plan. Use it for your own devices, or
+> only in ways your agreement with Anthropic allows. Don't expose it to the
+> public internet, and don't use it to resell or pool access. You are solely
+> responsible for how your credentials are used through this proxy.
+
 ## What it does
 
-1. **Listens** for HTTP requests from a remote Claude Code CLI.
+1. **Listens** for HTTP requests from a Claude Code CLI.
 2. **Secures** the endpoint with a configurable shared-secret header
-   (constant-time comparison) so only your friend can use it.
+   (constant-time comparison) so only clients you authorize can use it.
 3. **Overrides** the incoming auth headers — strips the client's
    `authorization` / `x-api-key`, injects your OAuth token as
    `Authorization: Bearer …`, sets the `Host` to `api.anthropic.com`, and
@@ -36,15 +53,18 @@ is a shared secret to hand your friend.
 5. **Auto-discovers** your OAuth token from your local Claude Code credentials
    and **auto-refreshes** it when it expires — writing the new token back so
    your own CLI stays in sync.
-6. **Restricts** which models the client may call and caps reasoning effort
+6. **Restricts** which models a client may call and caps reasoning effort
    (optional), rejecting others before they reach Anthropic.
-7. **Expires** access after an optional trial window (`ACCESS_DURATION`).
+7. **Expires** access after an optional time window (`ACCESS_DURATION`).
 8. **Reads** configuration from a `.env` file (only the shared secret is required).
 
-## Setup (you, the host)
+## Requirements
 
-Requires Node.js 18+ and that **you're logged into Claude Code on this machine**
-(`claude` at least once). No `npm install` needed — it uses only built-ins.
+- Node.js 18+ (no `npm install` — it uses only built-ins).
+- You've logged into Claude Code at least once on the host machine (`claude`),
+  so a token exists for the proxy to read.
+
+## Setup (the host machine)
 
 ```bash
 # 1. Configure — the only required value is the shared secret
@@ -66,7 +86,7 @@ You'll see it confirm the token was found automatically:
 
 ### Generate a strong shared secret
 
-This is the one thing you make up and give to your friend — treat it like a
+This is the one value you create and give to each client — treat it like a
 password.
 
 ```bash
@@ -85,21 +105,21 @@ It re-reads on each request and, when the token is within a minute of expiry,
 uses the stored refresh token to fetch a new one and saves it back. So you
 should never hit an expiry-related 401.
 
-If for some reason discovery doesn't fit your setup, you can override it:
+If discovery doesn't fit your setup, you can override it:
 
 - `ANTHROPIC_OAUTH_TOKEN` — pin a specific token (disables auto-refresh).
 - `CLAUDE_CREDENTIALS_PATH` — point at a credentials file in a non-default spot.
 - `AUTO_REFRESH=false` — turn off automatic refresh.
 
-## Setup (your friend, the client)
+## Setup (the client device)
 
-Expose the proxy to them (LAN IP, a tunnel like `cloudflared` / `ngrok`, or a
-small VPS), then they run their CLI against it:
+Make the proxy reachable from the client (a LAN IP, a tunnel like `cloudflared`,
+or a small VPS you own), then run the CLI against it:
 
 ```bash
 export ANTHROPIC_BASE_URL="http://YOUR_PROXY_HOST:8787"
 export ANTHROPIC_API_KEY="sk-ant-dummy"                 # any value; the proxy discards it
-export ANTHROPIC_CUSTOM_HEADERS="x-proxy-secret: the-shared-secret-you-gave-them"
+export ANTHROPIC_CUSTOM_HEADERS="x-proxy-secret: your-shared-secret"
 claude
 ```
 
@@ -110,23 +130,23 @@ claude
 - `ANTHROPIC_CUSTOM_HEADERS` attaches the shared secret to every request. (If
   you changed `PROXY_SECRET_HEADER`, use that header name instead.)
 
-The friend does **not** need a Claude subscription or to log in — that's the
-whole point.
+The client device does **not** need to be logged into Claude Code — that's the
+point: credentials live only on the host.
 
 ## Windows (PowerShell) quickstart
 
 The proxy is cross-platform; only the shell commands differ. Run these in
 **PowerShell**.
 
-**Host (you)** — make sure you've run `claude` and logged in first, so the
-token exists at `%USERPROFILE%\.claude\.credentials.json`:
+**Host** — make sure you've run `claude` and logged in first, so the token
+exists at `%USERPROFILE%\.claude\.credentials.json`:
 
 ```powershell
 git clone https://github.com/shanuflash/claude-code-proxy.git
 cd claude-code-proxy
 Copy-Item .env.example .env
 
-# Generate a strong shared secret (the only thing you must set + share):
+# Generate a strong shared secret (the one value you must set + share):
 -join ((1..32) | ForEach-Object { '{0:x2}' -f (Get-Random -Maximum 256) })
 
 notepad .env      # paste that value into PROXY_SECRET, save
@@ -136,24 +156,23 @@ npm start         # needs Node 18+ (winget install OpenJS.NodeJS if missing)
 The token is picked up automatically — you should see
 `[proxy] OAuth token discovered from file` in the output.
 
-**Client (your friend, also Windows):**
+**Client (also Windows):**
 
 ```powershell
 $env:ANTHROPIC_BASE_URL       = "http://YOUR_PROXY_HOST:8787"
 $env:ANTHROPIC_API_KEY        = "sk-ant-dummy"   # any value; proxy discards it, skips login
-$env:ANTHROPIC_CUSTOM_HEADERS = "x-proxy-secret: the-shared-secret-you-gave-them"
+$env:ANTHROPIC_CUSTOM_HEADERS = "x-proxy-secret: your-shared-secret"
 claude
 ```
 
 Notes:
-- If both of you are on the **same PC** (just trialing), use
-  `http://localhost:8787` and leave `HOST=0.0.0.0` (or set `HOST=127.0.0.1`).
-- Across the internet, expose it with a tunnel — e.g. `cloudflared.exe tunnel
-  --url http://localhost:8787` — and give your friend the resulting `https://…`
-  URL. This also encrypts the shared secret in transit.
-- Windows Firewall may prompt the first time the port is opened — allow it.
+- On the **same PC**, use `http://localhost:8787` (set `HOST=127.0.0.1`).
+- On the **same network**, use the host's LAN IP (`ipconfig`) and allow the port
+  through Windows Firewall.
+- Across the internet, use a tunnel (below) rather than opening a port — it
+  gives you HTTPS so the shared secret isn't sent in the clear.
 
-## Persistent URL with a Cloudflare named tunnel
+## Persistent HTTPS with a Cloudflare named tunnel
 
 If you already run a domain's DNS on Cloudflare, a **named tunnel** gives you a
 stable `https://<sub>.yourdomain.com` instead of a random quick-tunnel URL, all
@@ -169,7 +188,7 @@ open any firewall port or bind to `0.0.0.0`.
 2. Go to **one.dash.cloudflare.com** → **Networks → Tunnels → Create a tunnel**
    → **Cloudflared** → name it (e.g. `claude-proxy`) → **Save**.
 3. Pick your OS; copy the install command it shows and run it in an
-   **elevated** shell. To just trial it without installing a service, run:
+   **elevated** shell. To just try it without installing a service, run:
    ```powershell
    cloudflared.exe tunnel run --token <TOKEN_FROM_DASHBOARD>
    ```
@@ -180,24 +199,23 @@ open any firewall port or bind to `0.0.0.0`.
    - Save. Cloudflare auto-creates the proxied DNS record.
 5. Start the proxy (`npm start`) and hit `https://ccproxy.yourdomain.com/health`.
 
-Your friend then points `ANTHROPIC_BASE_URL` at `https://ccproxy.yourdomain.com`.
+Then point the client's `ANTHROPIC_BASE_URL` at `https://ccproxy.yourdomain.com`.
 
 Notes:
 - Use a **fresh subdomain** — this won't affect your existing site.
 - Claude's SSE stream keeps bytes flowing, so Cloudflare's ~100s
   origin-response timeout isn't a problem; leave HTTP settings at defaults
   (don't enable "Disable Chunked Encoding").
-- Optional hardening: you *can* put Cloudflare Access in front, but a CLI
+- For an extra layer, you can put **Cloudflare Access** in front, but a CLI
   client then needs an Access **service token** (`CF-Access-Client-Id` /
-  `CF-Access-Client-Secret` headers). The built-in shared secret is usually
-  enough for a trusted trial.
+  `CF-Access-Client-Secret` headers).
 
 ## Test it locally
 
 ```bash
 # Health check (no auth):
 curl http://localhost:8787/health
-# -> {"status":"ok"}
+# -> {"status":"ok","tokenSource":"file"}
 
 # Wrong / missing secret is rejected:
 curl -i http://localhost:8787/v1/messages -X POST
@@ -230,10 +248,10 @@ curl -N http://localhost:8787/v1/messages \
 | `BLOCKED_MODELS`          | no       | —                             | Comma-separated substrings; matching models are rejected with `403`.   |
 | `ALLOWED_MODELS`          | no       | —                             | If set, only matching models are allowed (everything else `403`).      |
 | `MAX_EFFORT`              | no       | —                             | Cap reasoning effort; requests above it get `403`. See below.          |
-| `ACCESS_DURATION`         | no       | —                             | Trial time limit (`1h`, `30m`, `90s`, `2d`). See below.                |
+| `ACCESS_DURATION`         | no       | —                             | Time limit (`1h`, `30m`, `90s`, `2d`). See below.                      |
 | `ACCESS_START_MODE`       | no       | `first-use`                   | Start the clock on `first-use` or `server-start`.                      |
 | `ACCESS_EXPIRE_ACTION`    | no       | `reject`                      | On expiry: `reject` (403s, stays up) or `shutdown` (exits).            |
-| `ACCESS_STATE_FILE`       | no       | `./.access-start`             | Where the start time persists (delete to reset the trial).             |
+| `ACCESS_STATE_FILE`       | no       | `./.access-start`             | Where the start time persists (delete to reset the window).            |
 | `UPSTREAM_HOST`           | no       | `api.anthropic.com`           | Upstream API host.                                                     |
 
 ### Restricting models
@@ -243,35 +261,39 @@ they reach Anthropic (so no quota is spent). Matching is case-insensitive
 substring, so `fable` blocks `claude-fable-5`.
 
 ```bash
-# Block Fable (and anything else with "fable" in the id):
+# Block a specific model (matches any id containing "fable"):
 BLOCKED_MODELS=fable
 
 # Or lock the client to a whitelist — everything else is rejected:
-ALLOWED_MODELS=sonnet,haiku
+ALLOWED_MODELS=sonnet,haiku,opus
 ```
+
+> Note: Claude Code makes background calls with Haiku (title/summary
+> generation), so if you use `ALLOWED_MODELS`, include `haiku` or the CLI's
+> background requests will 403.
 
 Blocked requests get an Anthropic-style `403` error, which the client CLI
 surfaces as a normal error message.
 
 ### Capping reasoning effort
 
-The proxy also reads `output_config.effort` and can reject requests above a
-ceiling. Levels low→high are `low`, `medium`, `high`, `xhigh`, `max`.
+The proxy reads `output_config.effort` and rejects requests above a ceiling.
+Levels low→high are `low`, `medium`, `high`, `xhigh`, `max`.
 
 ```bash
-MAX_EFFORT=high   # xhigh / max requests get 403
+MAX_EFFORT=xhigh   # allows Claude Code's default (xhigh); blocks only "max"
 ```
 
-⚠️ **Claude Code defaults to `xhigh`.** With a cap below `xhigh`, your friend's
-default requests will be rejected until they lower effort on their side. If
-you'd rather the proxy silently **clamp** effort down to the ceiling (rewrite
-the request instead of rejecting it) so nothing breaks, that's a small change —
-just ask.
+`.env.example` ships with `MAX_EFFORT=xhigh`, which permits Claude Code's
+default effort and blocks only the most expensive `max` tier. Set it lower
+(e.g. `high`) to save more — but note that if the ceiling is **below** the
+client's effort, those requests get a `403` until the client lowers effort.
+Remove the line for no cap.
 
-### Trial time limit
+### Time limit
 
-Give your friend a fixed window. After `ACCESS_DURATION` elapses, every request
-gets a `403 access window has expired`.
+After `ACCESS_DURATION` elapses, every request gets a `403 access window has
+expired`. Useful for lending access for a bounded period.
 
 ```bash
 ACCESS_DURATION=1h        # 1h / 30m / 90s / 2d (bare number = minutes)
@@ -280,8 +302,8 @@ ACCESS_DURATION=1h        # 1h / 30m / 90s / 2d (bare number = minutes)
 - **When the clock starts:** `first-use` (default) begins timing on the first
   authenticated request; `server-start` begins when you launch the proxy.
 - **Survives restarts:** the start time is persisted to `.access-start`
-  (git-ignored). Restarting the proxy does **not** grant a fresh hour. To reset
-  the trial, delete that file (path configurable via `ACCESS_STATE_FILE`).
+  (git-ignored). Restarting the proxy does **not** grant a fresh window. To
+  reset, delete that file (path configurable via `ACCESS_STATE_FILE`).
 - **On expiry:** `ACCESS_EXPIRE_ACTION=reject` (default) keeps the proxy up and
   returns 403s (so `/health` still reports status); `shutdown` exits the process.
 - **Check remaining time:** `GET /health` includes `access.expiresAt` and
@@ -294,8 +316,14 @@ ACCESS_DURATION=1h        # 1h / 30m / 90s / 2d (bare number = minutes)
 - Auto-refresh writes the renewed token back to your `~/.claude/.credentials.json`
   (atomic write, other fields preserved) — the same file your own CLI uses.
 - Anyone with the shared secret can spend your subscription quota. Treat it
-  like a password; rotate it (`PROXY_SECRET`) if it leaks.
-- Prefer terminating TLS in front of the proxy (tunnel / reverse proxy) so the
-  shared secret isn't sent in clear text over the public internet.
-- This is intended for a quick, trusted trial — not a hardened multi-tenant
-  gateway.
+  like a password; rotate it (`PROXY_SECRET`) if it leaks, and use a unique one
+  per device if you can.
+- Always terminate TLS in front of the proxy (a tunnel or reverse proxy) before
+  it leaves your own machine — otherwise the shared secret travels in clear text.
+- This is a lightweight personal gateway, not a hardened multi-tenant service.
+  Don't expose it to the open internet.
+
+## License
+
+[MIT](./LICENSE). Provided as-is, with no warranty. You are responsible for
+complying with Anthropic's terms when using it.

@@ -1,7 +1,7 @@
 {
   "name": "claude-code-proxy",
   "version": "1.0.0",
-  "description": "Lightweight credential proxy for sharing a Claude Code subscription without exposing your OAuth token.",
+  "description": "Self-hosted gateway to use your own Claude subscription from your other devices without copying credential files around.",
   "license": "MIT",
   "type": "commonjs",
   "engines": {

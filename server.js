@@ -1,20 +1,24 @@
 'use strict';
 
 /**
- * Claude Code credential proxy
- * ----------------------------
- * A tiny, dependency-free reverse proxy that lets someone use YOUR Claude
- * subscription without ever seeing your credentials.
+ * claude-code-proxy
+ * -----------------
+ * A tiny, dependency-free self-hosted gateway that lets you use your own Claude
+ * subscription from your other devices without copying credential files around.
  *
- * A remote Claude Code CLI points `ANTHROPIC_BASE_URL` at this server. Each
- * request must carry a shared-secret header (so only people you trust can use
- * it). The proxy then strips whatever auth the client sent, injects your own
- * OAuth token + the real Anthropic host, and streams the upstream response
- * (including Server-Sent Events) straight back with no buffering.
+ * A Claude Code CLI points `ANTHROPIC_BASE_URL` at this server. Each request
+ * must carry a shared-secret header (so only clients you authorize can use it).
+ * The proxy strips whatever auth the client sent, injects the OAuth token it
+ * reads from your local Claude Code login + the real Anthropic host, and streams
+ * the upstream response (including Server-Sent Events) straight back with no
+ * buffering.
  *
  * The OAuth token is discovered automatically from your local Claude Code
  * credentials (no copy/paste needed) and refreshed on the fly when it expires.
  * Everything else is configured from a `.env` file — see `.env.example`.
+ *
+ * You are responsible for using this in line with Anthropic's terms — it
+ * forwards your credentials, so every request counts as your own usage.
  */
 
 const http = require('node:http');
