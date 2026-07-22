@@ -85,6 +85,22 @@ const OAUTH_TOKEN_URL =
 // Refresh this many ms before the token actually expires.
 const REFRESH_SKEW_MS = 60_000;
 
+// --- Model policy ---
+// Comma-separated, case-insensitive substrings matched against the request's
+// "model" field. BLOCKED_MODELS rejects any match (e.g. "fable" blocks
+// claude-fable-5). ALLOWED_MODELS, if set, permits ONLY matching models.
+function parseList(v) {
+  return (v || '')
+    .split(',')
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
+}
+const BLOCKED_MODELS = parseList(process.env.BLOCKED_MODELS);
+const ALLOWED_MODELS = parseList(process.env.ALLOWED_MODELS);
+// Max request body we'll buffer to inspect the model (bytes). Requests larger
+// than this are rejected with 413. Generous default for image-heavy prompts.
+const MAX_REQUEST_BYTES = Number(process.env.MAX_REQUEST_BYTES || 100 * 1024 * 1024);
+
 function fail(msg) {
   console.error(`[config] ${msg}`);
   process.exit(1);
@@ -277,6 +293,55 @@ function secretMatches(provided) {
 }
 
 // ---------------------------------------------------------------------------
+// Model policy
+// ---------------------------------------------------------------------------
+// Buffer the request body (bounded) so we can read its "model" field.
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    req.on('data', (c) => {
+      size += c.length;
+      if (size > MAX_REQUEST_BYTES) {
+        const err = new Error('request body too large');
+        err.code = 'TOO_LARGE';
+        reject(err);
+        req.destroy();
+        return;
+      }
+      chunks.push(c);
+    });
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('error', reject);
+  });
+}
+
+// Extract the requested model from a JSON body (returns null if not present).
+function parseModel(body, contentType) {
+  if (!body || body.length === 0) return null;
+  if (contentType && !contentType.toLowerCase().includes('json')) return null;
+  try {
+    const j = JSON.parse(body.toString('utf8'));
+    return typeof j.model === 'string' ? j.model : null;
+  } catch {
+    return null;
+  }
+}
+
+// Decide whether a model is permitted. Allowlist (if set) wins, then blocklist.
+function modelDecision(model) {
+  if (!model) return { ok: true };
+  const m = model.toLowerCase();
+  if (ALLOWED_MODELS.length && !ALLOWED_MODELS.some((s) => m.includes(s))) {
+    return { ok: false, reason: `model '${model}' is not in this proxy's allowed list` };
+  }
+  if (BLOCKED_MODELS.some((s) => m.includes(s))) {
+    return { ok: false, reason: `model '${model}' is blocked by this proxy` };
+  }
+  return { ok: true };
+}
+
+// ---------------------------------------------------------------------------
 // Build the header set sent upstream: drop the client's auth, inject ours.
 // ---------------------------------------------------------------------------
 function buildUpstreamHeaders(incoming, token) {
@@ -333,6 +398,32 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // Buffer the request body so we can inspect the requested model. (Only the
+  // request is buffered — the streamed SSE *response* still flows unbuffered.)
+  let body;
+  try {
+    body = await readBody(req);
+  } catch (e) {
+    if (e.code === 'TOO_LARGE') {
+      res.writeHead(413, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'request body too large' }));
+    } else if (!res.headersSent) {
+      res.writeHead(400, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'could not read request body' }));
+    }
+    return;
+  }
+
+  // Enforce the model policy before spending a token refresh or hitting upstream.
+  const model = parseModel(body, req.headers['content-type']);
+  const decision = modelDecision(model);
+  if (!decision.ok) {
+    console.log(`[policy] blocked ${req.method} ${req.url} -> ${decision.reason}`);
+    res.writeHead(403, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ type: 'error', error: { type: 'forbidden', message: decision.reason } }));
+    return;
+  }
+
   // Resolve (and if needed refresh) the OAuth token to inject.
   let token = '';
   try {
@@ -348,9 +439,13 @@ const server = http.createServer(async (req, res) => {
           'no upstream credentials available — log into Claude Code on this machine or set ANTHROPIC_OAUTH_TOKEN',
       })
     );
-    req.resume();
     return;
   }
+
+  const headers = buildUpstreamHeaders(req.headers, token);
+  // We forward a fixed buffer, so set an accurate content-length.
+  if (body.length > 0) headers['content-length'] = Buffer.byteLength(body);
+  else delete headers['content-length'];
 
   const upstreamReq = https.request(
     {
@@ -358,7 +453,7 @@ const server = http.createServer(async (req, res) => {
       port: 443,
       method: req.method,
       path: req.url,
-      headers: buildUpstreamHeaders(req.headers, token),
+      headers,
     },
     (upstreamRes) => {
       // Mirror status + headers, then stream the body straight through.
@@ -379,9 +474,8 @@ const server = http.createServer(async (req, res) => {
     }
   });
 
-  // Stream the client's request body upstream without buffering it.
-  req.pipe(upstreamReq);
-  req.on('error', () => upstreamReq.destroy());
+  if (body.length > 0) upstreamReq.write(body);
+  upstreamReq.end();
 });
 
 // Disable Nagle so SSE chunks flush to the client immediately.
@@ -392,6 +486,8 @@ server.listen(PORT, HOST, () => {
   console.log(`[proxy] listening on http://${HOST}:${PORT}`);
   console.log(`[proxy] forwarding to https://${UPSTREAM_HOST}`);
   console.log(`[proxy] shared-secret header: ${SECRET_HEADER}`);
+  if (ALLOWED_MODELS.length) console.log(`[proxy] model allowlist: ${ALLOWED_MODELS.join(', ')}`);
+  if (BLOCKED_MODELS.length) console.log(`[proxy] model blocklist: ${BLOCKED_MODELS.join(', ')}`);
   if (cache.token) {
     const exp = cache.expiresAt ? ` (expires ${new Date(cache.expiresAt).toISOString()})` : '';
     console.log(`[proxy] OAuth token discovered from ${cache.source}${exp}`);

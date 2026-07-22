@@ -36,7 +36,9 @@ is a shared secret to hand your friend.
 5. **Auto-discovers** your OAuth token from your local Claude Code credentials
    and **auto-refreshes** it when it expires — writing the new token back so
    your own CLI stays in sync.
-6. **Reads** configuration from a `.env` file (only the shared secret is required).
+6. **Restricts** which models the client may call (optional allow/block list),
+   rejecting others before they reach Anthropic.
+7. **Reads** configuration from a `.env` file (only the shared secret is required).
 
 ## Setup (you, the host)
 
@@ -224,7 +226,26 @@ curl -N http://localhost:8787/v1/messages \
 | `ANTHROPIC_OAUTH_TOKEN`   | no       | *(auto-discovered)*           | Pin a specific token manually; disables auto-refresh.                  |
 | `CLAUDE_CREDENTIALS_PATH` | no       | `~/.claude/.credentials.json` | Where to read the Claude Code token from.                              |
 | `AUTO_REFRESH`            | no       | `true`                        | Auto-refresh the token when it expires (`false` to disable).           |
+| `BLOCKED_MODELS`          | no       | —                             | Comma-separated substrings; matching models are rejected with `403`.   |
+| `ALLOWED_MODELS`          | no       | —                             | If set, only matching models are allowed (everything else `403`).      |
 | `UPSTREAM_HOST`           | no       | `api.anthropic.com`           | Upstream API host.                                                     |
+
+### Restricting models
+
+The proxy reads the `model` field from each request and can block models before
+they reach Anthropic (so no quota is spent). Matching is case-insensitive
+substring, so `fable` blocks `claude-fable-5`.
+
+```bash
+# Block Fable (and anything else with "fable" in the id):
+BLOCKED_MODELS=fable
+
+# Or lock the client to a whitelist — everything else is rejected:
+ALLOWED_MODELS=sonnet,haiku
+```
+
+Blocked requests get an Anthropic-style `403` error, which the client CLI
+surfaces as a normal error message.
 
 ## Security notes
 
