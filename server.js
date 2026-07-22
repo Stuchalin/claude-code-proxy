@@ -12,14 +12,18 @@
  * OAuth token + the real Anthropic host, and streams the upstream response
  * (including Server-Sent Events) straight back with no buffering.
  *
- * Everything is configured from a `.env` file — see `.env.example`.
+ * The OAuth token is discovered automatically from your local Claude Code
+ * credentials (no copy/paste needed) and refreshed on the fly when it expires.
+ * Everything else is configured from a `.env` file — see `.env.example`.
  */
 
 const http = require('node:http');
 const https = require('node:https');
 const crypto = require('node:crypto');
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
+const { execFileSync } = require('node:child_process');
 
 // ---------------------------------------------------------------------------
 // Minimal .env loader (avoids a dotenv dependency so this stays zero-install).
@@ -58,12 +62,28 @@ loadEnvFile(path.join(__dirname, '.env'));
 const PORT = Number(process.env.PORT || 8787);
 const HOST = process.env.HOST || '0.0.0.0';
 const PROXY_SECRET = process.env.PROXY_SECRET || '';
-const OAUTH_TOKEN = process.env.ANTHROPIC_OAUTH_TOKEN || '';
 const UPSTREAM_HOST = process.env.UPSTREAM_HOST || 'api.anthropic.com';
 // Header the client must send carrying the shared secret.
 const SECRET_HEADER = (process.env.PROXY_SECRET_HEADER || 'x-proxy-secret').toLowerCase();
 // Beta flag Anthropic requires for subscription OAuth tokens.
 const OAUTH_BETA = 'oauth-2025-04-20';
+
+// --- Token discovery / refresh settings ---
+// Optional hard override: if set, this token is used as-is and never refreshed.
+const EXPLICIT_TOKEN = process.env.ANTHROPIC_OAUTH_TOKEN || '';
+// Where Claude Code keeps its credentials on this machine.
+const CREDS_PATH =
+  process.env.CLAUDE_CREDENTIALS_PATH ||
+  path.join(os.homedir(), '.claude', '.credentials.json');
+// Auto-refresh the token when it's expired (default on). Set AUTO_REFRESH=false to disable.
+const AUTO_REFRESH = (process.env.AUTO_REFRESH || 'true').toLowerCase() !== 'false';
+// Claude Code's public OAuth client id + token endpoint (overridable).
+const OAUTH_CLIENT_ID =
+  process.env.OAUTH_CLIENT_ID || '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
+const OAUTH_TOKEN_URL =
+  process.env.OAUTH_TOKEN_URL || 'https://console.anthropic.com/v1/oauth/token';
+// Refresh this many ms before the token actually expires.
+const REFRESH_SKEW_MS = 60_000;
 
 function fail(msg) {
   console.error(`[config] ${msg}`);
@@ -71,7 +91,179 @@ function fail(msg) {
 }
 
 if (!PROXY_SECRET) fail('PROXY_SECRET is required (shared secret your client must send).');
-if (!OAUTH_TOKEN) fail('ANTHROPIC_OAUTH_TOKEN is required (your subscription OAuth token).');
+
+// ---------------------------------------------------------------------------
+// Token cache + discovery
+//   Priority: explicit env var  ->  credentials file  ->  macOS Keychain.
+//   The file is re-read only when its mtime changes, so a token refreshed by
+//   your own Claude Code CLI is picked up automatically.
+// ---------------------------------------------------------------------------
+let cache = { token: '', refreshToken: '', expiresAt: 0, source: 'none', mtimeMs: 0 };
+let refreshPromise = null;
+
+// Claude Code stores expiresAt in ms; tolerate a seconds value just in case.
+function normalizeExpiry(v) {
+  if (!v || typeof v !== 'number') return 0;
+  return v < 1e12 ? v * 1000 : v;
+}
+
+function loadFromFile() {
+  const st = fs.statSync(CREDS_PATH); // throws if the file is missing
+  if (cache.source === 'file' && st.mtimeMs === cache.mtimeMs && cache.token) {
+    return true; // unchanged since last read
+  }
+  const data = JSON.parse(fs.readFileSync(CREDS_PATH, 'utf8'));
+  const o = data.claudeAiOauth || {};
+  if (!o.accessToken) return false;
+  cache = {
+    token: o.accessToken,
+    refreshToken: o.refreshToken || '',
+    expiresAt: normalizeExpiry(o.expiresAt),
+    source: 'file',
+    mtimeMs: st.mtimeMs,
+  };
+  return true;
+}
+
+function loadFromKeychain() {
+  // macOS stores the same JSON blob in the login Keychain.
+  for (const service of ['Claude Code-credentials', 'Claude Code']) {
+    try {
+      const raw = execFileSync('security', ['find-generic-password', '-s', service, '-w'], {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+      });
+      const o = (JSON.parse(raw).claudeAiOauth) || {};
+      if (o.accessToken) {
+        cache = {
+          token: o.accessToken,
+          refreshToken: o.refreshToken || '',
+          expiresAt: normalizeExpiry(o.expiresAt),
+          source: 'keychain',
+          mtimeMs: 0,
+        };
+        return true;
+      }
+    } catch {
+      /* try the next service name */
+    }
+  }
+  return false;
+}
+
+function loadCredentials() {
+  if (EXPLICIT_TOKEN) {
+    if (cache.source !== 'env') {
+      cache = { token: EXPLICIT_TOKEN, refreshToken: '', expiresAt: 0, source: 'env', mtimeMs: 0 };
+    }
+    return;
+  }
+  try {
+    if (loadFromFile()) return;
+  } catch {
+    /* file missing / unreadable — fall through */
+  }
+  if (process.platform === 'darwin' && loadFromKeychain()) return;
+}
+
+// Persist a freshly refreshed token back to the credentials file (atomic write,
+// preserving any other fields) so your own CLI and this proxy stay in sync.
+function persistToFile(token, refreshToken, expiresAt) {
+  try {
+    const data = JSON.parse(fs.readFileSync(CREDS_PATH, 'utf8'));
+    data.claudeAiOauth = {
+      ...(data.claudeAiOauth || {}),
+      accessToken: token,
+      refreshToken: refreshToken,
+      expiresAt: expiresAt,
+    };
+    const tmp = `${CREDS_PATH}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(data, null, 2), { mode: 0o600 });
+    fs.renameSync(tmp, CREDS_PATH);
+    cache.mtimeMs = fs.statSync(CREDS_PATH).mtimeMs;
+  } catch (e) {
+    console.error(`[refresh] could not persist new token: ${e.message}`);
+  }
+}
+
+function doRefresh() {
+  return new Promise((resolve) => {
+    const body = JSON.stringify({
+      grant_type: 'refresh_token',
+      refresh_token: cache.refreshToken,
+      client_id: OAUTH_CLIENT_ID,
+    });
+    const u = new URL(OAUTH_TOKEN_URL);
+    const req = https.request(
+      {
+        hostname: u.hostname,
+        port: u.port || 443,
+        path: u.pathname + u.search,
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          accept: 'application/json',
+          'content-length': Buffer.byteLength(body),
+        },
+      },
+      (resp) => {
+        let d = '';
+        resp.on('data', (c) => (d += c));
+        resp.on('end', () => {
+          if (resp.statusCode !== 200) {
+            console.error(`[refresh] failed (${resp.statusCode}): ${d.slice(0, 200)}`);
+            return resolve();
+          }
+          try {
+            const j = JSON.parse(d);
+            const newToken = j.access_token;
+            if (!newToken) {
+              console.error('[refresh] response had no access_token');
+              return resolve();
+            }
+            const newRefresh = j.refresh_token || cache.refreshToken;
+            const expiresAt = j.expires_in ? Date.now() + j.expires_in * 1000 : 0;
+            cache.token = newToken;
+            cache.refreshToken = newRefresh;
+            cache.expiresAt = expiresAt;
+            console.log('[refresh] access token refreshed');
+            if (cache.source === 'file') persistToFile(newToken, newRefresh, expiresAt);
+          } catch (e) {
+            console.error(`[refresh] could not parse response: ${e.message}`);
+          }
+          resolve();
+        });
+      }
+    );
+    req.on('error', (e) => {
+      console.error(`[refresh] request error: ${e.message}`);
+      resolve();
+    });
+    req.write(body);
+    req.end();
+  });
+}
+
+// Single-flight refresh so concurrent requests don't all hit the token endpoint.
+function refreshToken() {
+  if (!cache.refreshToken) return Promise.resolve();
+  if (!refreshPromise) {
+    refreshPromise = doRefresh().finally(() => {
+      refreshPromise = null;
+    });
+  }
+  return refreshPromise;
+}
+
+async function getToken() {
+  loadCredentials();
+  const expired =
+    cache.expiresAt && Date.now() >= cache.expiresAt - REFRESH_SKEW_MS;
+  if (!EXPLICIT_TOKEN && AUTO_REFRESH && cache.refreshToken && expired) {
+    await refreshToken();
+  }
+  return cache.token;
+}
 
 // ---------------------------------------------------------------------------
 // Constant-time shared-secret check
@@ -87,7 +279,7 @@ function secretMatches(provided) {
 // ---------------------------------------------------------------------------
 // Build the header set sent upstream: drop the client's auth, inject ours.
 // ---------------------------------------------------------------------------
-function buildUpstreamHeaders(incoming) {
+function buildUpstreamHeaders(incoming, token) {
   const headers = { ...incoming };
 
   // Hop-by-hop / routing headers that must not be forwarded as-is.
@@ -107,7 +299,7 @@ function buildUpstreamHeaders(incoming) {
 
   // Point at the real Anthropic API and inject the subscription OAuth token.
   headers['host'] = UPSTREAM_HOST;
-  headers['authorization'] = `Bearer ${OAUTH_TOKEN}`;
+  headers['authorization'] = `Bearer ${token}`;
 
   // Ensure the OAuth beta flag is present (append without clobbering others).
   const existingBeta = incoming['anthropic-beta'];
@@ -125,11 +317,11 @@ function buildUpstreamHeaders(incoming) {
 // ---------------------------------------------------------------------------
 // Server
 // ---------------------------------------------------------------------------
-const server = http.createServer((req, res) => {
+const server = http.createServer(async (req, res) => {
   // Lightweight, unauthenticated health check for uptime probes.
   if (req.method === 'GET' && req.url === '/health') {
     res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ status: 'ok' }));
+    res.end(JSON.stringify({ status: 'ok', tokenSource: cache.source }));
     return;
   }
 
@@ -137,7 +329,25 @@ const server = http.createServer((req, res) => {
   if (!secretMatches(req.headers[SECRET_HEADER])) {
     res.writeHead(401, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ error: 'unauthorized: missing or invalid proxy secret' }));
-    // Drain the incoming body so the socket can be reused/closed cleanly.
+    req.resume(); // drain the body so the socket closes cleanly
+    return;
+  }
+
+  // Resolve (and if needed refresh) the OAuth token to inject.
+  let token = '';
+  try {
+    token = await getToken();
+  } catch (e) {
+    console.error(`[token] ${e.message}`);
+  }
+  if (!token) {
+    res.writeHead(502, { 'content-type': 'application/json' });
+    res.end(
+      JSON.stringify({
+        error:
+          'no upstream credentials available — log into Claude Code on this machine or set ANTHROPIC_OAUTH_TOKEN',
+      })
+    );
     req.resume();
     return;
   }
@@ -148,7 +358,7 @@ const server = http.createServer((req, res) => {
       port: 443,
       method: req.method,
       path: req.url,
-      headers: buildUpstreamHeaders(req.headers),
+      headers: buildUpstreamHeaders(req.headers, token),
     },
     (upstreamRes) => {
       // Mirror status + headers, then stream the body straight through.
@@ -178,7 +388,17 @@ const server = http.createServer((req, res) => {
 server.on('connection', (socket) => socket.setNoDelay(true));
 
 server.listen(PORT, HOST, () => {
+  loadCredentials(); // warm the cache so we can report status at boot
   console.log(`[proxy] listening on http://${HOST}:${PORT}`);
   console.log(`[proxy] forwarding to https://${UPSTREAM_HOST}`);
   console.log(`[proxy] shared-secret header: ${SECRET_HEADER}`);
+  if (cache.token) {
+    const exp = cache.expiresAt ? ` (expires ${new Date(cache.expiresAt).toISOString()})` : '';
+    console.log(`[proxy] OAuth token discovered from ${cache.source}${exp}`);
+  } else {
+    console.warn(
+      `[proxy] WARNING: no OAuth token found yet. Log into Claude Code on this machine ` +
+        `(checked ${EXPLICIT_TOKEN ? 'ANTHROPIC_OAUTH_TOKEN' : CREDS_PATH}), or set ANTHROPIC_OAUTH_TOKEN.`
+    );
+  }
 });

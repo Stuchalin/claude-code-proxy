@@ -10,6 +10,10 @@ they sent, injects *your* OAuth token, and forwards everything to
 `api.anthropic.com`. Streamed responses (SSE) pass straight through in
 real-time.
 
+Your token is **discovered automatically** from your local Claude Code login
+and **refreshed on the fly** when it expires — so the only thing you configure
+is a shared secret to hand your friend.
+
 ```
 ┌──────────────────┐   x-proxy-secret    ┌───────────┐  Bearer <your token>  ┌──────────────────┐
 │ Friend's CLI     │ ──────────────────▶ │  proxy    │ ────────────────────▶ │ api.anthropic.com │
@@ -29,48 +33,60 @@ real-time.
    ensures the `oauth-2025-04-20` beta flag is present.
 4. **Streams** Server-Sent Events back to the client with no buffering
    (`TCP_NODELAY` + immediate header flush + direct pipe).
-5. **Reads** all configuration (port, secret, token) from a `.env` file.
+5. **Auto-discovers** your OAuth token from your local Claude Code credentials
+   and **auto-refreshes** it when it expires — writing the new token back so
+   your own CLI stays in sync.
+6. **Reads** configuration from a `.env` file (only the shared secret is required).
 
 ## Setup (you, the host)
 
-Requires Node.js 18+ (no `npm install` needed — it uses only built-ins).
+Requires Node.js 18+ and that **you're logged into Claude Code on this machine**
+(`claude` at least once). No `npm install` needed — it uses only built-ins.
 
 ```bash
-# 1. Configure
+# 1. Configure — the only required value is the shared secret
 cp .env.example .env
-$EDITOR .env            # set PROXY_SECRET and ANTHROPIC_OAUTH_TOKEN
+$EDITOR .env            # set PROXY_SECRET (invent any long random string)
 
 # 2. Run
 npm start               # ≡ node server.js
 ```
 
-You'll see:
+You'll see it confirm the token was found automatically:
 
 ```
 [proxy] listening on http://0.0.0.0:8787
 [proxy] forwarding to https://api.anthropic.com
 [proxy] shared-secret header: x-proxy-secret
+[proxy] OAuth token discovered from file (expires 2026-…)
 ```
 
-### Where's my OAuth token?
-
-On the machine where you're logged into Claude Code:
-
-- **Linux:** `~/.claude/.credentials.json` → `.claudeAiOauth.accessToken`
-  ```bash
-  cat ~/.claude/.credentials.json | grep -o '"accessToken":"[^"]*"'
-  ```
-- **macOS:** Keychain item **"Claude Code"** (or the same
-  `~/.claude/.credentials.json` file).
-
-It starts with `sk-ant-oat…`. **These tokens expire** — if upstream starts
-returning `401`, refresh the value in `.env` and restart.
-
 ### Generate a strong shared secret
+
+This is the one thing you make up and give to your friend — treat it like a
+password.
 
 ```bash
 openssl rand -hex 32
 ```
+
+### About the OAuth token (you normally do nothing here)
+
+The proxy reads your token from where Claude Code stores it:
+
+- **Linux / Windows:** `~/.claude/.credentials.json`
+- **macOS:** the same file, or the **"Claude Code"** Keychain item (read via
+  the `security` tool automatically).
+
+It re-reads on each request and, when the token is within a minute of expiry,
+uses the stored refresh token to fetch a new one and saves it back. So you
+should never hit an expiry-related 401.
+
+If for some reason discovery doesn't fit your setup, you can override it:
+
+- `ANTHROPIC_OAUTH_TOKEN` — pin a specific token (disables auto-refresh).
+- `CLAUDE_CREDENTIALS_PATH` — point at a credentials file in a non-default spot.
+- `AUTO_REFRESH=false` — turn off automatic refresh.
 
 ## Setup (your friend, the client)
 
@@ -91,22 +107,23 @@ request. (If you changed `PROXY_SECRET_HEADER`, use that header name instead.)
 The proxy is cross-platform; only the shell commands differ. Run these in
 **PowerShell**.
 
-**Host (you):**
+**Host (you)** — make sure you've run `claude` and logged in first, so the
+token exists at `%USERPROFILE%\.claude\.credentials.json`:
 
 ```powershell
 git clone https://github.com/shanuflash/claude-code-proxy.git
 cd claude-code-proxy
 Copy-Item .env.example .env
 
-# Read your Claude Code OAuth token:
-(Get-Content "$env:USERPROFILE\.claude\.credentials.json" | ConvertFrom-Json).claudeAiOauth.accessToken
-
-# Generate a strong shared secret:
+# Generate a strong shared secret (the only thing you must set + share):
 -join ((1..32) | ForEach-Object { '{0:x2}' -f (Get-Random -Maximum 256) })
 
-notepad .env      # paste PROXY_SECRET and ANTHROPIC_OAUTH_TOKEN, save
+notepad .env      # paste that value into PROXY_SECRET, save
 npm start         # needs Node 18+ (winget install OpenJS.NodeJS if missing)
 ```
+
+The token is picked up automatically — you should see
+`[proxy] OAuth token discovered from file` in the output.
 
 **Client (your friend, also Windows):**
 
@@ -150,18 +167,23 @@ curl -N http://localhost:8787/v1/messages \
 
 ## Configuration reference
 
-| Variable                | Required | Default             | Description                                        |
-| ----------------------- | -------- | ------------------- | -------------------------------------------------- |
-| `PORT`                  | no       | `8787`              | Port to listen on.                                 |
-| `HOST`                  | no       | `0.0.0.0`           | Bind interface (`127.0.0.1` = localhost only).     |
-| `PROXY_SECRET`          | **yes**  | —                   | Shared secret the client must send.                |
-| `PROXY_SECRET_HEADER`   | no       | `x-proxy-secret`    | Header name carrying the secret.                   |
-| `ANTHROPIC_OAUTH_TOKEN` | **yes**  | —                   | Your subscription OAuth token (injected upstream). |
-| `UPSTREAM_HOST`         | no       | `api.anthropic.com` | Upstream API host.                                 |
+| Variable                  | Required | Default                       | Description                                                            |
+| ------------------------- | -------- | ----------------------------- | ---------------------------------------------------------------------- |
+| `PROXY_SECRET`            | **yes**  | —                             | Shared secret the client must send.                                    |
+| `PORT`                    | no       | `8787`                        | Port to listen on.                                                     |
+| `HOST`                    | no       | `0.0.0.0`                     | Bind interface (`127.0.0.1` = localhost only).                         |
+| `PROXY_SECRET_HEADER`     | no       | `x-proxy-secret`              | Header name carrying the secret.                                       |
+| `ANTHROPIC_OAUTH_TOKEN`   | no       | *(auto-discovered)*           | Pin a specific token manually; disables auto-refresh.                  |
+| `CLAUDE_CREDENTIALS_PATH` | no       | `~/.claude/.credentials.json` | Where to read the Claude Code token from.                              |
+| `AUTO_REFRESH`            | no       | `true`                        | Auto-refresh the token when it expires (`false` to disable).           |
+| `UPSTREAM_HOST`           | no       | `api.anthropic.com`           | Upstream API host.                                                     |
 
 ## Security notes
 
-- The real `.env` is git-ignored — **never commit your token**.
+- The real `.env` is git-ignored — and with auto-discovery there's usually no
+  token in it to leak anyway.
+- Auto-refresh writes the renewed token back to your `~/.claude/.credentials.json`
+  (atomic write, other fields preserved) — the same file your own CLI uses.
 - Anyone with the shared secret can spend your subscription quota. Treat it
   like a password; rotate it (`PROXY_SECRET`) if it leaks.
 - Prefer terminating TLS in front of the proxy (tunnel / reverse proxy) so the
