@@ -150,6 +150,45 @@ Notes:
   URL. This also encrypts the shared secret in transit.
 - Windows Firewall may prompt the first time the port is opened — allow it.
 
+## Persistent URL with a Cloudflare named tunnel
+
+If you already run a domain's DNS on Cloudflare, a **named tunnel** gives you a
+stable `https://<sub>.yourdomain.com` instead of a random quick-tunnel URL, all
+managed from the Zero Trust dashboard. It's free.
+
+When using a tunnel, set `HOST=127.0.0.1` in `.env` — only `cloudflared`
+(running on the same machine) needs to reach the proxy, so there's no need to
+open any firewall port or bind to `0.0.0.0`.
+
+**Dashboard-managed setup (easiest):**
+
+1. `winget install Cloudflare.cloudflared` (Windows) / `brew install cloudflared` (Mac).
+2. Go to **one.dash.cloudflare.com** → **Networks → Tunnels → Create a tunnel**
+   → **Cloudflared** → name it (e.g. `claude-proxy`) → **Save**.
+3. Pick your OS; copy the install command it shows and run it in an
+   **elevated** shell. To just trial it without installing a service, run:
+   ```powershell
+   cloudflared.exe tunnel run --token <TOKEN_FROM_DASHBOARD>
+   ```
+   The connector should flip to **Connected** in the dashboard.
+4. In the tunnel's **Public Hostname** tab → **Add a public hostname**:
+   - **Subdomain:** e.g. `ccproxy`  · **Domain:** pick yours  · **Path:** empty
+   - **Service → Type:** `HTTP`  · **URL:** `localhost:8787`
+   - Save. Cloudflare auto-creates the proxied DNS record.
+5. Start the proxy (`npm start`) and hit `https://ccproxy.yourdomain.com/health`.
+
+Your friend then points `ANTHROPIC_BASE_URL` at `https://ccproxy.yourdomain.com`.
+
+Notes:
+- Use a **fresh subdomain** — this won't affect your existing site.
+- Claude's SSE stream keeps bytes flowing, so Cloudflare's ~100s
+  origin-response timeout isn't a problem; leave HTTP settings at defaults
+  (don't enable "Disable Chunked Encoding").
+- Optional hardening: you *can* put Cloudflare Access in front, but a CLI
+  client then needs an Access **service token** (`CF-Access-Client-Id` /
+  `CF-Access-Client-Secret` headers). The built-in shared secret is usually
+  enough for a trusted trial.
+
 ## Test it locally
 
 ```bash
