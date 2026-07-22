@@ -86,6 +86,44 @@ claude
 `ANTHROPIC_CUSTOM_HEADERS` makes the CLI attach the shared secret to every
 request. (If you changed `PROXY_SECRET_HEADER`, use that header name instead.)
 
+## Windows (PowerShell) quickstart
+
+The proxy is cross-platform; only the shell commands differ. Run these in
+**PowerShell**.
+
+**Host (you):**
+
+```powershell
+git clone https://github.com/shanuflash/claude-code-proxy.git
+cd claude-code-proxy
+Copy-Item .env.example .env
+
+# Read your Claude Code OAuth token:
+(Get-Content "$env:USERPROFILE\.claude\.credentials.json" | ConvertFrom-Json).claudeAiOauth.accessToken
+
+# Generate a strong shared secret:
+-join ((1..32) | ForEach-Object { '{0:x2}' -f (Get-Random -Maximum 256) })
+
+notepad .env      # paste PROXY_SECRET and ANTHROPIC_OAUTH_TOKEN, save
+npm start         # needs Node 18+ (winget install OpenJS.NodeJS if missing)
+```
+
+**Client (your friend, also Windows):**
+
+```powershell
+$env:ANTHROPIC_BASE_URL   = "http://YOUR_PROXY_HOST:8787"
+$env:ANTHROPIC_CUSTOM_HEADERS = "x-proxy-secret: the-shared-secret-you-gave-them"
+claude
+```
+
+Notes:
+- If both of you are on the **same PC** (just trialing), use
+  `http://localhost:8787` and leave `HOST=0.0.0.0` (or set `HOST=127.0.0.1`).
+- Across the internet, expose it with a tunnel — e.g. `cloudflared.exe tunnel
+  --url http://localhost:8787` — and give your friend the resulting `https://…`
+  URL. This also encrypts the shared secret in transit.
+- Windows Firewall may prompt the first time the port is opened — allow it.
+
 ## Test it locally
 
 ```bash
