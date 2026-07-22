@@ -1,0 +1,13 @@
+{
+  "name": "claude-code-proxy",
+  "version": "1.0.0",
+  "description": "Lightweight credential proxy for sharing a Claude Code subscription without exposing your OAuth token.",
+  "license": "MIT",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node server.js"
+  }
+}

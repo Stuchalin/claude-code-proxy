@@ -1,0 +1,10 @@
+# Secrets — never commit the real .env
+.env
+
+# Node
+node_modules/
+npm-debug.log*
+
+# Editor / OS cruft
+.DS_Store
+*.swp
