@@ -1,6 +1,9 @@
 # Secrets — never commit the real .env
 .env
 
+# Access-window state (trial clock)
+.access-start
+
 # Node
 node_modules/
 npm-debug.log*

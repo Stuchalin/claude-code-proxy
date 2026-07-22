@@ -110,6 +110,54 @@ if (MAX_EFFORT && !(MAX_EFFORT in EFFORT_ORDER)) {
 // than this are rejected with 413. Generous default for image-heavy prompts.
 const MAX_REQUEST_BYTES = Number(process.env.MAX_REQUEST_BYTES || 100 * 1024 * 1024);
 
+// --- Access window (trial time limit) ---
+// After ACCESS_DURATION elapses, the proxy refuses further requests. The clock
+// starts on first use (default) or at server start, and is persisted so a
+// restart doesn't hand out a fresh window. Delete the state file to reset.
+function parseDuration(v) {
+  if (!v) return 0;
+  const m = String(v).trim().match(/^(\d+(?:\.\d+)?)\s*(s|m|h|d)?$/i);
+  if (!m) {
+    console.error(`[config] ACCESS_DURATION must look like 1h / 30m / 90s / 2d (got '${v}')`);
+    process.exit(1);
+  }
+  const mult = { s: 1000, m: 60000, h: 3600000, d: 86400000 }[(m[2] || 'm').toLowerCase()];
+  return Math.round(parseFloat(m[1]) * mult); // bare number => minutes
+}
+const ACCESS_DURATION_MS = parseDuration(process.env.ACCESS_DURATION);
+const ACCESS_START_MODE = (process.env.ACCESS_START_MODE || 'first-use').toLowerCase();
+const ACCESS_STATE_FILE = process.env.ACCESS_STATE_FILE || path.join(__dirname, '.access-start');
+// What to do once expired: 'reject' (403 every request) or 'shutdown' (exit).
+const ACCESS_EXPIRE_ACTION = (process.env.ACCESS_EXPIRE_ACTION || 'reject').toLowerCase();
+
+let accessStart = 0; // ms epoch the window began; 0 = not started yet
+
+function loadAccessStart() {
+  try {
+    const n = parseInt(fs.readFileSync(ACCESS_STATE_FILE, 'utf8').trim(), 10);
+    if (Number.isFinite(n) && n > 0) accessStart = n;
+  } catch {
+    /* no prior state */
+  }
+}
+
+function startAccessWindow() {
+  if (accessStart) return; // already running
+  accessStart = Date.now();
+  try {
+    fs.writeFileSync(ACCESS_STATE_FILE, String(accessStart), { mode: 0o600 });
+  } catch (e) {
+    console.error(`[access] could not persist start time: ${e.message}`);
+  }
+  console.log(
+    `[access] window started; expires ${new Date(accessStart + ACCESS_DURATION_MS).toISOString()}`
+  );
+}
+
+function accessExpired() {
+  return Boolean(ACCESS_DURATION_MS && accessStart && Date.now() >= accessStart + ACCESS_DURATION_MS);
+}
+
 function fail(msg) {
   console.error(`[config] ${msg}`);
   process.exit(1);
@@ -415,8 +463,15 @@ function buildUpstreamHeaders(incoming, token) {
 const server = http.createServer(async (req, res) => {
   // Lightweight, unauthenticated health check for uptime probes.
   if (req.method === 'GET' && req.url === '/health') {
+    const body = { status: 'ok', tokenSource: cache.source };
+    if (ACCESS_DURATION_MS) {
+      body.access = {
+        expired: accessExpired(),
+        expiresAt: accessStart ? new Date(accessStart + ACCESS_DURATION_MS).toISOString() : null,
+      };
+    }
     res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ status: 'ok', tokenSource: cache.source }));
+    res.end(JSON.stringify(body));
     return;
   }
 
@@ -426,6 +481,28 @@ const server = http.createServer(async (req, res) => {
     res.end(JSON.stringify({ error: 'unauthorized: missing or invalid proxy secret' }));
     req.resume(); // drain the body so the socket closes cleanly
     return;
+  }
+
+  // Enforce the trial access window. Clock starts on first authenticated use.
+  if (ACCESS_DURATION_MS) {
+    if (ACCESS_START_MODE === 'first-use') startAccessWindow();
+    if (accessExpired()) {
+      console.log(`[access] expired — refused ${req.method} ${req.url}`);
+      res.writeHead(403, { 'content-type': 'application/json' });
+      res.end(
+        JSON.stringify({
+          type: 'error',
+          error: { type: 'forbidden', message: 'access window has expired' },
+        })
+      );
+      req.resume();
+      if (ACCESS_EXPIRE_ACTION === 'shutdown') {
+        console.log('[access] shutting down (ACCESS_EXPIRE_ACTION=shutdown)');
+        server.close(() => process.exit(0));
+        setTimeout(() => process.exit(0), 1000).unref();
+      }
+      return;
+    }
   }
 
   // Buffer the request body so we can inspect the requested model. (Only the
@@ -519,6 +596,22 @@ server.listen(PORT, HOST, () => {
   if (ALLOWED_MODELS.length) console.log(`[proxy] model allowlist: ${ALLOWED_MODELS.join(', ')}`);
   if (BLOCKED_MODELS.length) console.log(`[proxy] model blocklist: ${BLOCKED_MODELS.join(', ')}`);
   if (MAX_EFFORT) console.log(`[proxy] max effort: ${MAX_EFFORT}`);
+  if (ACCESS_DURATION_MS) {
+    loadAccessStart();
+    if (ACCESS_START_MODE === 'server-start') startAccessWindow();
+    const ms = ACCESS_DURATION_MS;
+    const dur =
+      ms % 86400000 === 0 ? `${ms / 86400000}d`
+      : ms % 3600000 === 0 ? `${ms / 3600000}h`
+      : ms % 60000 === 0 ? `${ms / 60000}m`
+      : `${ms / 1000}s`;
+    if (accessStart) {
+      const exp = new Date(accessStart + ACCESS_DURATION_MS).toISOString();
+      console.log(`[proxy] access window: ${dur} (${accessExpired() ? 'EXPIRED' : `expires ${exp}`})`);
+    } else {
+      console.log(`[proxy] access window: ${dur}, starts on first use`);
+    }
+  }
   if (cache.token) {
     const exp = cache.expiresAt ? ` (expires ${new Date(cache.expiresAt).toISOString()})` : '';
     console.log(`[proxy] OAuth token discovered from ${cache.source}${exp}`);

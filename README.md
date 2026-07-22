@@ -36,9 +36,10 @@ is a shared secret to hand your friend.
 5. **Auto-discovers** your OAuth token from your local Claude Code credentials
    and **auto-refreshes** it when it expires — writing the new token back so
    your own CLI stays in sync.
-6. **Restricts** which models the client may call (optional allow/block list),
-   rejecting others before they reach Anthropic.
-7. **Reads** configuration from a `.env` file (only the shared secret is required).
+6. **Restricts** which models the client may call and caps reasoning effort
+   (optional), rejecting others before they reach Anthropic.
+7. **Expires** access after an optional trial window (`ACCESS_DURATION`).
+8. **Reads** configuration from a `.env` file (only the shared secret is required).
 
 ## Setup (you, the host)
 
@@ -229,6 +230,10 @@ curl -N http://localhost:8787/v1/messages \
 | `BLOCKED_MODELS`          | no       | —                             | Comma-separated substrings; matching models are rejected with `403`.   |
 | `ALLOWED_MODELS`          | no       | —                             | If set, only matching models are allowed (everything else `403`).      |
 | `MAX_EFFORT`              | no       | —                             | Cap reasoning effort; requests above it get `403`. See below.          |
+| `ACCESS_DURATION`         | no       | —                             | Trial time limit (`1h`, `30m`, `90s`, `2d`). See below.                |
+| `ACCESS_START_MODE`       | no       | `first-use`                   | Start the clock on `first-use` or `server-start`.                      |
+| `ACCESS_EXPIRE_ACTION`    | no       | `reject`                      | On expiry: `reject` (403s, stays up) or `shutdown` (exits).            |
+| `ACCESS_STATE_FILE`       | no       | `./.access-start`             | Where the start time persists (delete to reset the trial).             |
 | `UPSTREAM_HOST`           | no       | `api.anthropic.com`           | Upstream API host.                                                     |
 
 ### Restricting models
@@ -262,6 +267,25 @@ default requests will be rejected until they lower effort on their side. If
 you'd rather the proxy silently **clamp** effort down to the ceiling (rewrite
 the request instead of rejecting it) so nothing breaks, that's a small change —
 just ask.
+
+### Trial time limit
+
+Give your friend a fixed window. After `ACCESS_DURATION` elapses, every request
+gets a `403 access window has expired`.
+
+```bash
+ACCESS_DURATION=1h        # 1h / 30m / 90s / 2d (bare number = minutes)
+```
+
+- **When the clock starts:** `first-use` (default) begins timing on the first
+  authenticated request; `server-start` begins when you launch the proxy.
+- **Survives restarts:** the start time is persisted to `.access-start`
+  (git-ignored). Restarting the proxy does **not** grant a fresh hour. To reset
+  the trial, delete that file (path configurable via `ACCESS_STATE_FILE`).
+- **On expiry:** `ACCESS_EXPIRE_ACTION=reject` (default) keeps the proxy up and
+  returns 403s (so `/health` still reports status); `shutdown` exits the process.
+- **Check remaining time:** `GET /health` includes `access.expiresAt` and
+  `access.expired` when a window is configured.
 
 ## Security notes
 
