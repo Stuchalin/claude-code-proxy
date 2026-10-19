@@ -342,6 +342,32 @@ describe('usage cache: Retry-After and reset', timeout, () => {
     assert.equal(upstream.requests.length, 2);
   });
 
+  it('keeps the longer pause on a later 429 for another key', async () => {
+    await start({ USAGE_BACKOFF_MAX: '1200' });
+    // ?a=1 gets Retry-After 600 at once; ?a=2 gets Retry-After 1 slightly
+    // later, while both fetches are in flight.
+    upstream.handler = (req, res) => {
+      const long = req.url.endsWith('?a=1');
+      const answer = statusHandler(429, { 'retry-after': long ? '600' : '1' });
+      setTimeout(() => answer(req, res), long ? 0 : 200);
+    };
+    const started = Date.now();
+    const [a, b] = await Promise.all([
+      get(`${USAGE}?a=1`),
+      get(`${USAGE}?a=2`),
+    ]);
+    assert.equal(a.status, 429);
+    assert.equal(b.status, 429);
+    assert.equal(upstream.requests.length, 2);
+    const snap = JSON.parse((await get('/dashboard/data')).body);
+    assert.ok(snap.usage.pausedUntil >= started + 600000, 'keeps 600 s');
+    await sleep(1300); // past the 1 s Retry-After
+    const blocked = await get(`${USAGE}?a=3`);
+    assert.equal(blocked.status, 429);
+    assert.ok(Number(blocked.headers['retry-after']) > 500);
+    assert.equal(upstream.requests.length, 2);
+  });
+
   it('falls back to the backoff step on a past Retry-After date', async () => {
     await start({ USAGE_BACKOFF_BASE: '0.3', USAGE_BACKOFF_MAX: '10' });
     upstream.handler = statusHandler(429, {

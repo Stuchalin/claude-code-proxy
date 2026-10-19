@@ -11,7 +11,8 @@
  * The proxy strips whatever auth the client sent, injects the OAuth token it
  * reads from your local Claude Code login + the real Anthropic host, and streams
  * the upstream response (including Server-Sent Events) straight back with no
- * buffering.
+ * buffering. The one exception is GET /api/oauth/usage: with the usage cache
+ * on, its upstream body is buffered whole so it can be cached and replayed.
  *
  * The OAuth token is discovered automatically from your local Claude Code
  * credentials (no copy/paste needed) and refreshed on the fly when it expires.
@@ -898,12 +899,14 @@ function recordUsageResult(key, result) {
     );
     const retryMs = retryAfterMs(result.headers['retry-after']);
     const pauseMs = retryMs || usagePause.stepMs;
-    usagePause.until = now + pauseMs;
+    // Concurrent fetches for other keys can get their own 429: a later one
+    // never shortens a pause that is already running; only a 200 ends it.
+    usagePause.until = Math.max(usagePause.until, now + pauseMs);
     const why = retryMs
       ? 'Retry-After'
       : `backoff step ${usagePause.stepMs / 1000} s`;
     console.log(
-      `[usage] ${key}: upstream 429; pausing upstream calls for ${pauseMs / 1000} s (${why})`,
+      `[usage] ${key}: upstream 429; pausing upstream calls for ${(usagePause.until - now) / 1000} s (${why})`,
     );
   } else if (result.status >= 500) {
     console.error(`[usage] ${key}: upstream ${result.status}`);

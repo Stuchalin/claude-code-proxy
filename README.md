@@ -392,7 +392,9 @@ USAGE_USER_AGENT=claude-code/2.1.0
   in the future; otherwise it follows the backoff step: `USAGE_BACKOFF_BASE`,
   doubling on each consecutive `429`, capped at `USAGE_BACKOFF_MAX`. The step
   advances on every `429`, even when `Retry-After` set the pause; only a `200`
-  resets it. During an active pause, requests are answered in this order,
+  resets it. A later `429` (for example from a concurrent fetch for another
+  key) can extend a running pause but never shortens it. During an active
+  pause, requests are answered in this order,
   without calling Anthropic: an entry younger than `USAGE_CACHE_TTL` is still
   served as a fresh `hit`; otherwise an entry younger than
   `USAGE_CACHE_MAX_STALE` is served as `stale`; otherwise the proxy answers
