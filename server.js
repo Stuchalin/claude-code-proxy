@@ -1060,8 +1060,9 @@ function snapshot() {
   const byModel = [...stats.byModel.entries()]
     .map(([model, m]) => ({ model, ...m }))
     .sort((a, b) => b.cost - a.cost);
+  const now = Date.now();
   return {
-    now: Date.now(),
+    now,
     serverStart,
     tokenSource: cache.source,
     tokenExpiresAt: cache.expiresAt || null,
@@ -1074,6 +1075,17 @@ function snapshot() {
     totals: stats.totals,
     clients,
     byModel,
+    // GET /api/oauth/usage cache. pausedUntil is null unless the 429 pause
+    // is running now; pauseStepMs is the current escalation step (0 = none),
+    // kept after a pause ends until the next upstream 200 resets it.
+    usage: {
+      enabled: USAGE_CACHE,
+      ttlMs: USAGE_CACHE_TTL_MS,
+      maxStaleMs: USAGE_CACHE_MAX_STALE_MS,
+      ...usageStats,
+      pausedUntil: usagePause.until > now ? usagePause.until : null,
+      pauseStepMs: usagePause.stepMs,
+    },
   };
 }
 
@@ -1114,6 +1126,8 @@ a{color:#c8a2ff}
 </header>
 <div class="wrap">
   <div class="cards" id="cards"></div>
+  <h2>Usage cache <span id="usagecfg"></span></h2>
+  <div class="cards" id="usagecards"></div>
   <h2>Connected clients</h2>
   <table><thead><tr>
     <th>Client IP</th><th>Status</th><th>Now / last</th>
@@ -1134,6 +1148,7 @@ const fmt=n=>n>=1e6?(n/1e6).toFixed(2)+'M':n>=1e3?(n/1e3).toFixed(1)+'k':String(
 const usd=n=>'$'+(n||0).toFixed(n<1?4:2);
 const ago=ms=>{const s=Math.round((Date.now()-ms)/1000);if(s<60)return s+'s ago';const m=Math.round(s/60);if(m<60)return m+'m ago';return Math.round(m/60)+'h ago';};
 const esc=s=>(s||'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+const card=([k,v,cls])=>'<div class="card"><div class="k">'+esc(k)+'</div><div class="v'+(cls?' '+cls:'')+'">'+esc(v)+'</div></div>';
 const secret=new URLSearchParams(location.search).get('secret')||'';
 async function tick(){
   try{
@@ -1153,7 +1168,16 @@ async function tick(){
       ['Output tok',fmt(t.outputTokens)],
       ['Est. $ (API-equiv)',usd(t.cost)],
       ['Blocked / errors',fmt(t.blocked)+' / '+fmt(t.errors)],
-    ].map(([k,v])=>'<div class="card"><div class="k">'+k+'</div><div class="v">'+v+'</div></div>').join('');
+    ].map(card).join('');
+    const u=d.usage;
+    document.getElementById('usagecfg').textContent=u.enabled?'· ttl '+u.ttlMs/1000+' s · max stale '+u.maxStaleMs/1000+' s':'· off (USAGE_CACHE=false)';
+    const ucards=u.enabled?[
+      ['Hit / miss / stale',fmt(u.hit)+' / '+fmt(u.miss)+' / '+fmt(u.stale)],
+      ['Upstream fetches',fmt(u.fetches)],
+      ['Upstream 429s',fmt(u.rateLimited)],
+    ]:[];
+    if(u.enabled&&u.pausedUntil)ucards.push(['Upstream paused until',new Date(u.pausedUntil).toLocaleTimeString()+' ('+Math.max(1,Math.ceil((u.pausedUntil-d.now)/1000))+'s)','err']);
+    document.getElementById('usagecards').innerHTML=ucards.map(card).join('');
     document.getElementById('clients').innerHTML=d.clients.map(c=>{
       const live=c.active>0;
       const status=live?'<span class="badge live">● '+c.active+' active</span>':'<span class="idle">idle</span>';

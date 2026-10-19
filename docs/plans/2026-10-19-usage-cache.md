@@ -154,8 +154,8 @@ upstream 429s, upstream fetches) and the pause end time; the dashboard page show
 **Starting points:** `server.js` (`snapshot`, `DASHBOARD_HTML`).
 **Constraints:** dashboard stays self-contained (no external assets); field names stable for tests.
 **Done when:**
-- [ ] a test reads `/dashboard/data` and sees the counters change after hit/miss/429
-- [ ] the page renders the counters and the pause end (or nothing when not paused)
+- [x] a test reads `/dashboard/data` and sees the counters change after hit/miss/429
+- [x] the page renders the counters and the pause end (or nothing when not paused)
 
 ### Task 4: Verify acceptance criteria
 - [ ] every story and every Done-when above holds
