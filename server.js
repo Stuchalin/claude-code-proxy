@@ -11,7 +11,8 @@
  * The proxy strips whatever auth the client sent, injects the OAuth token it
  * reads from your local Claude Code login + the real Anthropic host, and streams
  * the upstream response (including Server-Sent Events) straight back with no
- * buffering.
+ * buffering. The one exception is GET /api/oauth/usage: with the usage cache
+ * on, its upstream body is buffered whole so it can be cached and replayed.
  *
  * The OAuth token is discovered automatically from your local Claude Code
  * credentials (no copy/paste needed) and refreshed on the fly when it expires.
@@ -67,6 +68,24 @@ const PORT = Number(process.env.PORT || 8787);
 const HOST = process.env.HOST || '0.0.0.0';
 const PROXY_SECRET = process.env.PROXY_SECRET || '';
 const UPSTREAM_HOST = process.env.UPSTREAM_HOST || 'api.anthropic.com';
+// Upstream protocol + port. Defaults talk to the real API over TLS; `http`
+// exists so tests can point the proxy at a local plain-HTTP fake upstream.
+const UPSTREAM_PROTOCOL = (
+  process.env.UPSTREAM_PROTOCOL || 'https'
+).toLowerCase();
+if (UPSTREAM_PROTOCOL !== 'https' && UPSTREAM_PROTOCOL !== 'http') {
+  fail(`UPSTREAM_PROTOCOL must be https or http (got '${UPSTREAM_PROTOCOL}')`);
+}
+const UPSTREAM_PORT = Number(process.env.UPSTREAM_PORT || 443);
+if (
+  !Number.isInteger(UPSTREAM_PORT) ||
+  UPSTREAM_PORT < 1 ||
+  UPSTREAM_PORT > 65535
+) {
+  fail(
+    `UPSTREAM_PORT must be an integer 1-65535 (got '${process.env.UPSTREAM_PORT}')`,
+  );
+}
 // Header the client must send carrying the shared secret.
 const SECRET_HEADER = (
   process.env.PROXY_SECRET_HEADER || 'x-proxy-secret'
@@ -120,6 +139,57 @@ if (MAX_EFFORT && !(MAX_EFFORT in EFFORT_ORDER)) {
 const MAX_REQUEST_BYTES = Number(
   process.env.MAX_REQUEST_BYTES || 100 * 1024 * 1024,
 );
+
+// --- Usage cache (GET /api/oauth/usage) ---
+// Every client polls the usage endpoint with the same OAuth token, so they
+// share one upstream rate limit. The proxy caches the 200 answer per path +
+// query, coalesces concurrent refreshes, serves a stale answer on 429 / 5xx /
+// network errors, and pauses upstream calls after a 429. Durations are in
+// seconds (fractional allowed). USAGE_CACHE=false restores plain pass-through.
+const USAGE_PATH = '/api/oauth/usage';
+const USAGE_CACHE_RAW = (process.env.USAGE_CACHE || 'true')
+  .trim()
+  .toLowerCase();
+if (USAGE_CACHE_RAW !== 'true' && USAGE_CACHE_RAW !== 'false') {
+  fail(`USAGE_CACHE must be true or false (got '${process.env.USAGE_CACHE}')`);
+}
+const USAGE_CACHE = USAGE_CACHE_RAW === 'true';
+function parseSeconds(name, raw, def) {
+  if (raw === undefined || String(raw).trim() === '') return def * 1000;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) {
+    fail(`${name} must be a positive number of seconds (got '${raw}')`);
+  }
+  return n * 1000;
+}
+const USAGE_CACHE_TTL_MS = parseSeconds(
+  'USAGE_CACHE_TTL',
+  process.env.USAGE_CACHE_TTL,
+  60,
+);
+const USAGE_CACHE_MAX_STALE_MS = parseSeconds(
+  'USAGE_CACHE_MAX_STALE',
+  process.env.USAGE_CACHE_MAX_STALE,
+  900,
+);
+const USAGE_BACKOFF_BASE_MS = parseSeconds(
+  'USAGE_BACKOFF_BASE',
+  process.env.USAGE_BACKOFF_BASE,
+  300,
+);
+const USAGE_BACKOFF_MAX_MS = parseSeconds(
+  'USAGE_BACKOFF_MAX',
+  process.env.USAGE_BACKOFF_MAX,
+  1800,
+);
+const USAGE_USER_AGENT = process.env.USAGE_USER_AGENT || 'claude-code/2.1.0';
+try {
+  http.validateHeaderValue('user-agent', USAGE_USER_AGENT);
+} catch {
+  fail('USAGE_USER_AGENT is not a valid header value');
+}
+// Upper bound for one upstream usage exchange (headers + body).
+const USAGE_FETCH_TIMEOUT_MS = 30_000;
 
 // --- Access window (trial time limit) ---
 // After ACCESS_DURATION elapses, the proxy refuses further requests. The clock
@@ -199,6 +269,14 @@ const stats = {
   byModel: new Map(), // model -> { requests, inputTokens, outputTokens, cost }
   clients: new Map(), // ip -> { firstSeen, lastSeen, requests, inputTokens, outputTokens, cost, models:Set, active, lastModel, lastPrompt, lastStatus }
 };
+
+// Usage cache state (see handleUsage). Only upstream 200 answers are stored.
+const usageCache = new Map(); // req.url -> { body: Buffer, contentType, at }
+const usageInflight = new Map(); // req.url -> Promise of the upstream result
+// Global pause after an upstream 429: the limit is per token, and every key
+// shares one token. stepMs is the current escalation step (0 = none yet).
+const usagePause = { until: 0, stepMs: 0 };
+const usageStats = { hit: 0, miss: 0, stale: 0, rateLimited: 0, fetches: 0 };
 
 function clientKey(req) {
   // Behind a tunnel/proxy the socket IP is the edge; the real client is in
@@ -684,6 +762,284 @@ function buildUpstreamHeaders(incoming, token) {
   return headers;
 }
 
+// Open a request to the configured upstream (protocol, host, port). `options`
+// carries method, path and headers; the callback gets the upstream response.
+function upstreamRequest(options, onResponse) {
+  const transport = UPSTREAM_PROTOCOL === 'http' ? http : https;
+  return transport.request(
+    { ...options, hostname: UPSTREAM_HOST, port: UPSTREAM_PORT },
+    onResponse,
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Usage cache: GET /api/oauth/usage
+// ---------------------------------------------------------------------------
+const NO_TOKEN_MESSAGE =
+  'no upstream credentials available — log into Claude Code on this machine or set ANTHROPIC_OAUTH_TOKEN';
+// Response headers that describe the upstream connection, not the payload.
+const HOP_BY_HOP = [
+  'connection',
+  'keep-alive',
+  'proxy-connection',
+  'transfer-encoding',
+  'upgrade',
+  'te',
+  'trailer',
+  'content-length', // recomputed from the buffered body
+];
+
+// Parse Retry-After (delta-seconds or HTTP-date) into ms from now; 0 unless
+// it lies in the future.
+function retryAfterMs(value) {
+  if (!value) return 0;
+  const v = String(value).trim();
+  const ms = /^\d+$/.test(v)
+    ? Number(v) * 1000
+    : Date.parse(v) - Date.now() || 0;
+  return ms > 0 ? ms : 0;
+}
+
+// One upstream exchange, fully buffered. Resolves (never rejects) with
+//   { kind: 'response', status, headers, body } | { kind: 'network', error }
+//   | { kind: 'notoken' }.
+// A partial body (error / abort / close before 'end') is a network error.
+async function fetchUsage(req) {
+  // getToken() (and a refresh it may trigger) is not bounded by the timer
+  // below; doRefresh has no timeout of its own.
+  let token = '';
+  try {
+    token = await getToken();
+  } catch (e) {
+    console.error(`[token] ${e.message}`);
+  }
+  if (!token) return { kind: 'notoken' };
+
+  const headers = buildUpstreamHeaders(req.headers, token);
+  headers['user-agent'] = USAGE_USER_AGENT;
+  headers['accept-encoding'] = 'identity'; // cached bytes must be plain
+  delete headers['content-length'];
+  usageStats.fetches++;
+
+  return new Promise((resolve) => {
+    let settled = false;
+    let timer = null;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(result);
+    };
+    const netError = (error) => finish({ kind: 'network', error });
+
+    let upstreamReq;
+    try {
+      upstreamReq = upstreamRequest(
+        { method: 'GET', path: req.url, headers },
+        (upstreamRes) => {
+          const chunks = [];
+          let ended = false;
+          upstreamRes.on('data', (c) => chunks.push(c));
+          upstreamRes.once('end', () => {
+            ended = true;
+            finish({
+              kind: 'response',
+              status: upstreamRes.statusCode || 502,
+              headers: upstreamRes.headers,
+              body: Buffer.concat(chunks),
+            });
+          });
+          upstreamRes.once('error', netError);
+          upstreamRes.once('aborted', () =>
+            netError(new Error('upstream response aborted')),
+          );
+          upstreamRes.once('close', () => {
+            if (!ended) netError(new Error('upstream closed mid-response'));
+          });
+        },
+      );
+    } catch (e) {
+      netError(e);
+      return;
+    }
+    // One absolute deadline over the whole exchange (headers + body).
+    timer = setTimeout(
+      () =>
+        upstreamReq.destroy(
+          new Error(`timed out after ${USAGE_FETCH_TIMEOUT_MS / 1000} s`),
+        ),
+      USAGE_FETCH_TIMEOUT_MS,
+    );
+    upstreamReq.on('error', netError);
+    upstreamReq.end();
+  });
+}
+
+// Apply one upstream result to the shared state, once per fetch (not per
+// waiter): store a 200, reset or advance the 429 pause, log failures.
+function recordUsageResult(key, result) {
+  const now = Date.now();
+  if (result.kind === 'notoken') {
+    console.error(`[usage] ${key}: no upstream credentials`);
+  } else if (result.kind === 'network') {
+    console.error(`[usage] ${key}: upstream error: ${result.error.message}`);
+  } else if (result.status === 200) {
+    usageCache.set(key, {
+      body: result.body,
+      contentType: result.headers['content-type'],
+      at: now,
+    });
+    usagePause.until = 0;
+    usagePause.stepMs = 0;
+  } else if (result.status === 429) {
+    usageStats.rateLimited++;
+    usagePause.stepMs = Math.min(
+      usagePause.stepMs ? usagePause.stepMs * 2 : USAGE_BACKOFF_BASE_MS,
+      USAGE_BACKOFF_MAX_MS,
+    );
+    const retryMs = retryAfterMs(result.headers['retry-after']);
+    const pauseMs = retryMs || usagePause.stepMs;
+    // Concurrent fetches for other keys can get their own 429: a later one
+    // never shortens a pause that is already running; only a 200 ends it.
+    usagePause.until = Math.max(usagePause.until, now + pauseMs);
+    const why = retryMs
+      ? 'Retry-After'
+      : `backoff step ${usagePause.stepMs / 1000} s`;
+    console.log(
+      `[usage] ${key}: upstream 429; pausing upstream calls for ${(usagePause.until - now) / 1000} s (${why})`,
+    );
+  } else if (result.status >= 500) {
+    console.error(`[usage] ${key}: upstream ${result.status}`);
+  }
+  return result;
+}
+
+// Write one usage response and settle the client's dashboard stats.
+function sendUsage(res, client, status, headers, body) {
+  client.lastStatus = status;
+  client.active = Math.max(0, client.active - 1);
+  if (status >= 400) stats.totals.errors++;
+  const gone =
+    res.destroyed || res.writableEnded || (res.socket && res.socket.destroyed);
+  if (gone) return; // the client already left
+  res.writeHead(status, { ...headers, 'content-length': body.length });
+  res.end(body);
+}
+
+function sendCachedUsage(res, client, entry, kind) {
+  const headers = {
+    'x-proxy-cache': kind,
+    age: String(Math.floor((Date.now() - entry.at) / 1000)),
+  };
+  if (entry.contentType) headers['content-type'] = entry.contentType;
+  sendUsage(res, client, 200, headers, entry.body);
+}
+
+// Serve the usage entry if it is younger than USAGE_CACHE_MAX_STALE.
+function serveStale(res, client, key, reason) {
+  const entry = usageCache.get(key);
+  if (!entry || Date.now() - entry.at >= USAGE_CACHE_MAX_STALE_MS) {
+    return false;
+  }
+  usageStats.stale++;
+  const age = Math.floor((Date.now() - entry.at) / 1000);
+  console.log(`[usage] ${key}: serving stale (age ${age} s): ${reason}`);
+  sendCachedUsage(res, client, entry, 'stale');
+  return true;
+}
+
+function sendJsonUsage(res, client, status, obj, extra = {}) {
+  sendUsage(
+    res,
+    client,
+    status,
+    {
+      'content-type': 'application/json',
+      'x-proxy-cache': 'miss',
+      age: '0',
+      ...extra,
+    },
+    Buffer.from(JSON.stringify(obj)),
+  );
+}
+
+async function handleUsage(req, res, client) {
+  const key = req.url;
+  const entry = usageCache.get(key);
+  if (entry && Date.now() - entry.at < USAGE_CACHE_TTL_MS) {
+    usageStats.hit++;
+    sendCachedUsage(res, client, entry, 'hit');
+    return;
+  }
+
+  const pauseLeft = usagePause.until - Date.now();
+  if (pauseLeft > 0) {
+    if (serveStale(res, client, key, 'upstream paused after 429')) return;
+    const secs = Math.max(1, Math.ceil(pauseLeft / 1000));
+    sendJsonUsage(
+      res,
+      client,
+      429,
+      {
+        type: 'error',
+        error: {
+          type: 'rate_limit_error',
+          message: `usage endpoint is rate limited; retry in ${secs} s`,
+        },
+      },
+      { 'retry-after': String(secs) },
+    );
+    return;
+  }
+
+  // Single-flight: concurrent misses for one key share one upstream request.
+  let pending = usageInflight.get(key);
+  if (!pending) {
+    pending = fetchUsage(req)
+      .then((result) => recordUsageResult(key, result))
+      .finally(() => usageInflight.delete(key));
+    usageInflight.set(key, pending);
+  }
+  const result = await pending;
+
+  if (result.kind === 'response' && result.status === 200) {
+    usageStats.miss++;
+    const headers = { 'x-proxy-cache': 'miss', age: '0' };
+    if (result.headers['content-type'])
+      headers['content-type'] = result.headers['content-type'];
+    sendUsage(res, client, 200, headers, result.body);
+    return;
+  }
+
+  const retryable =
+    result.kind !== 'response' ||
+    result.status === 429 ||
+    result.status >= 500;
+  const reason =
+    result.kind === 'notoken'
+      ? 'no upstream credentials'
+      : result.kind === 'network'
+        ? `upstream error: ${result.error.message}`
+        : `upstream ${result.status}`;
+  if (retryable && serveStale(res, client, key, reason)) return;
+
+  if (result.kind === 'notoken') {
+    sendJsonUsage(res, client, 502, { error: NO_TOKEN_MESSAGE });
+  } else if (result.kind === 'network') {
+    sendJsonUsage(res, client, 502, {
+      error: 'bad gateway',
+      detail: result.error.message,
+    });
+  } else {
+    // Pass the upstream error through as is (status, headers, body).
+    const headers = { ...result.headers };
+    for (const h of HOP_BY_HOP) delete headers[h];
+    headers['x-proxy-cache'] = 'miss';
+    headers['age'] = '0';
+    sendUsage(res, client, result.status, headers, result.body);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Dashboard snapshot + page
 // ---------------------------------------------------------------------------
@@ -707,8 +1063,9 @@ function snapshot() {
   const byModel = [...stats.byModel.entries()]
     .map(([model, m]) => ({ model, ...m }))
     .sort((a, b) => b.cost - a.cost);
+  const now = Date.now();
   return {
-    now: Date.now(),
+    now,
     serverStart,
     tokenSource: cache.source,
     tokenExpiresAt: cache.expiresAt || null,
@@ -721,6 +1078,17 @@ function snapshot() {
     totals: stats.totals,
     clients,
     byModel,
+    // GET /api/oauth/usage cache. pausedUntil is null unless the 429 pause
+    // is running now; pauseStepMs is the current escalation step (0 = none),
+    // kept after a pause ends until the next upstream 200 resets it.
+    usage: {
+      enabled: USAGE_CACHE,
+      ttlMs: USAGE_CACHE_TTL_MS,
+      maxStaleMs: USAGE_CACHE_MAX_STALE_MS,
+      ...usageStats,
+      pausedUntil: usagePause.until > now ? usagePause.until : null,
+      pauseStepMs: usagePause.stepMs,
+    },
   };
 }
 
@@ -761,6 +1129,8 @@ a{color:#c8a2ff}
 </header>
 <div class="wrap">
   <div class="cards" id="cards"></div>
+  <h2>Usage cache <span id="usagecfg"></span></h2>
+  <div class="cards" id="usagecards"></div>
   <h2>Connected clients</h2>
   <table><thead><tr>
     <th>Client IP</th><th>Status</th><th>Now / last</th>
@@ -772,7 +1142,7 @@ a{color:#c8a2ff}
   </tr></thead><tbody id="models"></tbody></table>
   <p class="note">
     "Est. $" = what this traffic would cost at public per-token <em>API</em> prices — a usage yardstick, not a real charge (your subscription is a flat fee).
-    Account-level weekly/session limit % is not exposed by the Anthropic API, so it can't be shown here — check <span class="dim">/status</span> in your own CLI for that.
+    Account-level weekly/session limit % is not shown here: the proxy only caches the undocumented <span class="dim">/api/oauth/usage</span> answer for clients and does not read it — check <span class="dim">/status</span> in your own CLI for that.
     Stats reset when the proxy restarts.
   </p>
 </div>
@@ -781,6 +1151,7 @@ const fmt=n=>n>=1e6?(n/1e6).toFixed(2)+'M':n>=1e3?(n/1e3).toFixed(1)+'k':String(
 const usd=n=>'$'+(n||0).toFixed(n<1?4:2);
 const ago=ms=>{const s=Math.round((Date.now()-ms)/1000);if(s<60)return s+'s ago';const m=Math.round(s/60);if(m<60)return m+'m ago';return Math.round(m/60)+'h ago';};
 const esc=s=>(s||'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+const card=([k,v,cls])=>'<div class="card"><div class="k">'+esc(k)+'</div><div class="v'+(cls?' '+cls:'')+'">'+esc(v)+'</div></div>';
 const secret=new URLSearchParams(location.search).get('secret')||'';
 async function tick(){
   try{
@@ -800,7 +1171,16 @@ async function tick(){
       ['Output tok',fmt(t.outputTokens)],
       ['Est. $ (API-equiv)',usd(t.cost)],
       ['Blocked / errors',fmt(t.blocked)+' / '+fmt(t.errors)],
-    ].map(([k,v])=>'<div class="card"><div class="k">'+k+'</div><div class="v">'+v+'</div></div>').join('');
+    ].map(card).join('');
+    const u=d.usage;
+    document.getElementById('usagecfg').textContent=u.enabled?'· ttl '+u.ttlMs/1000+' s · max stale '+u.maxStaleMs/1000+' s':'· off (USAGE_CACHE=false)';
+    const ucards=u.enabled?[
+      ['Hit / miss / stale',fmt(u.hit)+' / '+fmt(u.miss)+' / '+fmt(u.stale)],
+      ['Upstream fetches',fmt(u.fetches)],
+      ['Upstream 429s',fmt(u.rateLimited)],
+    ]:[];
+    if(u.enabled&&u.pausedUntil)ucards.push(['Upstream paused until',new Date(u.pausedUntil).toLocaleTimeString()+' ('+Math.max(1,Math.ceil((u.pausedUntil-d.now)/1000))+'s)','err']);
+    document.getElementById('usagecards').innerHTML=ucards.map(card).join('');
     document.getElementById('clients').innerHTML=d.clients.map(c=>{
       const live=c.active>0;
       const status=live?'<span class="badge live">● '+c.active+' active</span>':'<span class="idle">idle</span>';
@@ -975,6 +1355,12 @@ const server = http.createServer(async (req, res) => {
   const preview = promptPreview(body, req.headers['content-type']);
   if (preview) client.lastPrompt = preview;
 
+  // The usage endpoint is served from a shared cache (a hit needs no token).
+  if (USAGE_CACHE && req.method === 'GET' && pathname === USAGE_PATH) {
+    await handleUsage(req, res, client);
+    return;
+  }
+
   // Resolve (and if needed refresh) the OAuth token to inject.
   let token = '';
   try {
@@ -984,12 +1370,7 @@ const server = http.createServer(async (req, res) => {
   }
   if (!token) {
     res.writeHead(502, { 'content-type': 'application/json' });
-    res.end(
-      JSON.stringify({
-        error:
-          'no upstream credentials available — log into Claude Code on this machine or set ANTHROPIC_OAUTH_TOKEN',
-      }),
-    );
+    res.end(JSON.stringify({ error: NO_TOKEN_MESSAGE }));
     return;
   }
 
@@ -998,10 +1379,8 @@ const server = http.createServer(async (req, res) => {
   if (body.length > 0) headers['content-length'] = Buffer.byteLength(body);
   else delete headers['content-length'];
 
-  const upstreamReq = https.request(
+  const upstreamReq = upstreamRequest(
     {
-      hostname: UPSTREAM_HOST,
-      port: 443,
       method: req.method,
       path: req.url,
       headers,
@@ -1041,17 +1420,28 @@ server.on('connection', (socket) => socket.setNoDelay(true));
 
 server.listen(PORT, HOST, () => {
   loadCredentials(); // warm the cache so we can report status at boot
-  console.log(`[proxy] listening on http://${HOST}:${PORT}`);
-  console.log(`[proxy] forwarding to https://${UPSTREAM_HOST}`);
+  const port = server.address().port; // bound port (PORT=0 picks a free one)
+  console.log(`[proxy] listening on http://${HOST}:${port}`);
+  console.log(
+    `[proxy] forwarding to ${UPSTREAM_PROTOCOL}://${UPSTREAM_HOST}:${UPSTREAM_PORT}`,
+  );
   console.log(`[proxy] shared-secret header: ${SECRET_HEADER}`);
   console.log(
-    `[proxy] dashboard: http://${HOST === '0.0.0.0' ? 'localhost' : HOST}:${PORT}/dashboard?secret=YOUR_SECRET`,
+    `[proxy] dashboard: http://${HOST === '0.0.0.0' ? 'localhost' : HOST}:${port}/dashboard?secret=YOUR_SECRET`,
   );
   if (ALLOWED_MODELS.length)
     console.log(`[proxy] model allowlist: ${ALLOWED_MODELS.join(', ')}`);
   if (BLOCKED_MODELS.length)
     console.log(`[proxy] model blocklist: ${BLOCKED_MODELS.join(', ')}`);
   if (MAX_EFFORT) console.log(`[proxy] max effort: ${MAX_EFFORT}`);
+  if (USAGE_CACHE) {
+    console.log(
+      `[proxy] usage cache: ttl ${USAGE_CACHE_TTL_MS / 1000} s, max stale ${USAGE_CACHE_MAX_STALE_MS / 1000} s, ` +
+        `429 backoff ${USAGE_BACKOFF_BASE_MS / 1000}-${USAGE_BACKOFF_MAX_MS / 1000} s, user-agent ${USAGE_USER_AGENT}`,
+    );
+  } else {
+    console.log('[proxy] usage cache: off (USAGE_CACHE=false)');
+  }
   if (ACCESS_DURATION_MS) {
     loadAccessStart();
     if (ACCESS_START_MODE === 'server-start') startAccessWindow();

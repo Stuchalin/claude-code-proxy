@@ -56,7 +56,10 @@ The intended use is **your own account, on machines you control**:
 6. **Restricts** which models a client may call and caps reasoning effort
    (optional), rejecting others before they reach Anthropic.
 7. **Expires** access after an optional time window (`ACCESS_DURATION`).
-8. **Reads** configuration from a `.env` file (only the shared secret is required).
+8. **Caches** the quota-usage endpoint (`GET /api/oauth/usage`) so many
+   polling clients share one upstream request instead of hitting Anthropic's
+   rate limit (see [Usage cache](#usage-cache)).
+9. **Reads** configuration from a `.env` file (only the shared secret is required).
 
 ## Requirements
 
@@ -79,8 +82,11 @@ You'll see it confirm the token was found automatically:
 
 ```
 [proxy] listening on http://0.0.0.0:8787
-[proxy] forwarding to https://api.anthropic.com
+[proxy] forwarding to https://api.anthropic.com:443
 [proxy] shared-secret header: x-proxy-secret
+[proxy] dashboard: http://localhost:8787/dashboard?secret=YOUR_SECRET
+[proxy] max effort: xhigh
+[proxy] usage cache: ttl 60 s, max stale 900 s, 429 backoff 300-1800 s, user-agent claude-code/2.1.0
 [proxy] OAuth token discovered from file (expires 2026-…)
 ```
 
@@ -234,6 +240,22 @@ curl -N http://localhost:8787/v1/messages \
       }'
 ```
 
+## Running tests
+
+```bash
+npm test                # ≡ node --test test/*.test.js
+```
+
+The suite uses only Node's built-in `node:test` runner — no `npm install`.
+The harness relies on `node:test`'s per-test `timeout` option, which needs
+Node 18.7 or newer. Each test spawns `server.js` as a child process against a
+local plain-HTTP fake upstream (via `UPSTREAM_PROTOCOL=http` and
+`UPSTREAM_PORT`), so it never talks to Anthropic and needs no real token.
+Every environment variable `server.js` reads is set explicitly for the child,
+so neither your shell nor your `.env` leaks into the tests. The shell expands
+`test/*.test.js`, so only the top-level `*.test.js` files run; the shared
+harness lives in `test/helpers/`.
+
 ## Configuration reference
 
 | Variable                  | Required | Default                       | Description                                                            |
@@ -252,7 +274,15 @@ curl -N http://localhost:8787/v1/messages \
 | `ACCESS_START_MODE`       | no       | `first-use`                   | Start the clock on `first-use` or `server-start`.                      |
 | `ACCESS_EXPIRE_ACTION`    | no       | `reject`                      | On expiry: `reject` (403s, stays up) or `shutdown` (exits).            |
 | `ACCESS_STATE_FILE`       | no       | `./.access-start`             | Where the start time persists (delete to reset the window).            |
+| `USAGE_CACHE`             | no       | `true`                        | Cache `GET /api/oauth/usage` (`false` = pass-through). See below.      |
+| `USAGE_CACHE_TTL`         | no       | `60`                          | Seconds a cached usage answer is served as fresh (`hit`).              |
+| `USAGE_CACHE_MAX_STALE`   | no       | `900`                         | Max age in seconds of a cached answer served on upstream errors.       |
+| `USAGE_BACKOFF_BASE`      | no       | `300`                         | First pause in seconds after an upstream `429` (no `Retry-After`).     |
+| `USAGE_BACKOFF_MAX`       | no       | `1800`                        | Cap in seconds for the doubling `429` pause.                           |
+| `USAGE_USER_AGENT`        | no       | `claude-code/2.1.0`           | Full `User-Agent` string sent upstream for the usage endpoint.         |
 | `UPSTREAM_HOST`           | no       | `api.anthropic.com`           | Upstream API host.                                                     |
+| `UPSTREAM_PORT`           | no       | `443`                         | Upstream port (integer 1-65535). Meant for tests.                      |
+| `UPSTREAM_PROTOCOL`       | no       | `https`                       | `https` or `http`. `http` exists for tests against a local fake.       |
 
 ### Restricting models
 
@@ -308,6 +338,95 @@ ACCESS_DURATION=1h        # 1h / 30m / 90s / 2d (bare number = minutes)
   returns 403s (so `/health` still reports status); `shutdown` exits the process.
 - **Check remaining time:** `GET /health` includes `access.expiresAt` and
   `access.expired` when a window is configured.
+
+### Usage cache
+
+Quota tools (ClaudeBar, Claude Code status lines) poll `GET /api/oauth/usage`.
+Through the proxy they all use the same OAuth token and poll the same
+endpoint, and Anthropic answers `429` when it is polled too often. The proxy
+therefore answers this one endpoint from a shared in-memory cache, which cuts
+the number of upstream requests. Every other path
+(`/v1/messages`, SSE streaming) is forwarded as before.
+
+> `/api/oauth/usage` is an **undocumented** Anthropic endpoint, and its rate
+> limit is not published. The TTL, stale and backoff values below are this
+> proxy's defaults, not Anthropic-documented numbers — tune them if needed.
+
+```bash
+USAGE_CACHE_TTL=60          # seconds; fractional values are allowed
+USAGE_CACHE_MAX_STALE=900
+USAGE_BACKOFF_BASE=300
+USAGE_BACKOFF_MAX=1800
+USAGE_USER_AGENT=claude-code/2.1.0
+```
+
+- **What is cached:** only `GET` requests whose path is exactly
+  `/api/oauth/usage`. The cache key is the full path plus query string, so
+  different queries are cached separately. Only a `200` answer is stored
+  (body and `content-type`); entries live in memory until the proxy restarts.
+- **Still gated:** the shared secret and the access window are checked first,
+  so no cached data is returned without the secret, and these requests still
+  appear in the dashboard's per-client stats. A cache hit needs no OAuth token.
+- **Fresh hit:** an entry younger than `USAGE_CACHE_TTL` is served without
+  contacting Anthropic.
+- **Refresh:** when the entry is older, the next request fetches a new one.
+  Concurrent requests for the same key share a single upstream request. The
+  upstream request carries `User-Agent: $USAGE_USER_AGENT` and
+  `Accept-Encoding: identity` (so the cached bytes are uncompressed and can be
+  replayed to any client). The whole upstream exchange (headers and body) is
+  bounded by a fixed 30 s timeout; the token lookup/refresh before it is not.
+- **Stale on error:** if the upstream answers `429` or `5xx`, the connection
+  fails or times out, or no OAuth token is available, the proxy serves the last
+  `200` answer as a `200` — as long as it is younger than
+  `USAGE_CACHE_MAX_STALE`. Otherwise the error goes to the client: the upstream
+  status, headers and body as is, `502 {"error":"bad gateway",…}` for a
+  network error, or the usual `502` "no upstream credentials" body.
+- **Other errors are not masked:** `401`, `403`, `404` and any other non-`200`
+  answer pass through as is; they are never cached and never replaced by a
+  stale answer.
+- **Pause after `429`:** one upstream `429` pauses upstream calls for **all**
+  usage keys. This global pause is the proxy's own policy, based on community
+  reports that the limit is per access token (all keys share one
+  token); Anthropic does not document it. The pause lasts as long
+  as the upstream `Retry-After` (seconds or an HTTP date) says when that lies
+  in the future; otherwise it follows the backoff step: `USAGE_BACKOFF_BASE`,
+  doubling on each consecutive `429`, capped at `USAGE_BACKOFF_MAX`. The step
+  advances on every `429`, even when `Retry-After` set the pause; only a `200`
+  resets it. A later `429` (for example from a concurrent fetch for another
+  key) can extend a running pause but never shortens it. During an active
+  pause, requests are answered in this order,
+  without calling Anthropic: an entry younger than `USAGE_CACHE_TTL` is still
+  served as a fresh `hit`; otherwise an entry younger than
+  `USAGE_CACHE_MAX_STALE` is served as `stale`; otherwise the proxy answers
+  `429` itself with `Retry-After` set to the seconds left and an
+  Anthropic-style `rate_limit_error` body.
+- **Diagnostic headers:** every usage answer carries `x-proxy-cache`
+  (`hit` or `stale` when served from the cache, `miss` for a fresh upstream
+  `200`, a passed-through error, or a proxy-made `429`/`502`) and `age` (the
+  cached entry's age in whole seconds, `0` for anything not from the cache).
+
+```bash
+curl -si http://localhost:8787/api/oauth/usage -H "x-proxy-secret: $PROXY_SECRET" \
+  | grep -iE '^(x-proxy-cache|age):'
+# first call:  x-proxy-cache: miss / age: 0
+# within TTL:  x-proxy-cache: hit  / age: <seconds>
+```
+
+The dashboard (`/dashboard?secret=…`) has a **Usage cache** section with the
+TTL and max-stale settings, hit / miss / stale counts, upstream fetches,
+upstream `429`s and, while a pause is active, when it ends. The same numbers
+are in the `usage` object of `/dashboard/data`.
+
+Lines tagged `[usage]` are logged only for upstream `429`s and pauses, `5xx`,
+network errors, missing credentials and stale serves; the token and the
+shared secret are never logged.
+
+Invalid values stop the proxy at startup with a `[config]` message:
+`USAGE_CACHE` must be `true` or `false`, the duration variables must be
+positive numbers of seconds, and `USAGE_USER_AGENT` must be a valid header
+value. Set `USAGE_CACHE=false` to turn the cache off
+entirely: the endpoint is then forwarded like any other request, with the
+client's own `User-Agent`.
 
 ## Security notes
 
