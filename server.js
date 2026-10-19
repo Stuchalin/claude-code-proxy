@@ -67,6 +67,24 @@ const PORT = Number(process.env.PORT || 8787);
 const HOST = process.env.HOST || '0.0.0.0';
 const PROXY_SECRET = process.env.PROXY_SECRET || '';
 const UPSTREAM_HOST = process.env.UPSTREAM_HOST || 'api.anthropic.com';
+// Upstream protocol + port. Defaults talk to the real API over TLS; `http`
+// exists so tests can point the proxy at a local plain-HTTP fake upstream.
+const UPSTREAM_PROTOCOL = (
+  process.env.UPSTREAM_PROTOCOL || 'https'
+).toLowerCase();
+if (UPSTREAM_PROTOCOL !== 'https' && UPSTREAM_PROTOCOL !== 'http') {
+  fail(`UPSTREAM_PROTOCOL must be https or http (got '${UPSTREAM_PROTOCOL}')`);
+}
+const UPSTREAM_PORT = Number(process.env.UPSTREAM_PORT || 443);
+if (
+  !Number.isInteger(UPSTREAM_PORT) ||
+  UPSTREAM_PORT < 1 ||
+  UPSTREAM_PORT > 65535
+) {
+  fail(
+    `UPSTREAM_PORT must be an integer 1-65535 (got '${process.env.UPSTREAM_PORT}')`,
+  );
+}
 // Header the client must send carrying the shared secret.
 const SECRET_HEADER = (
   process.env.PROXY_SECRET_HEADER || 'x-proxy-secret'
@@ -684,6 +702,16 @@ function buildUpstreamHeaders(incoming, token) {
   return headers;
 }
 
+// Open a request to the configured upstream (protocol, host, port). `options`
+// carries method, path and headers; the callback gets the upstream response.
+function upstreamRequest(options, onResponse) {
+  const transport = UPSTREAM_PROTOCOL === 'http' ? http : https;
+  return transport.request(
+    { ...options, hostname: UPSTREAM_HOST, port: UPSTREAM_PORT },
+    onResponse,
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Dashboard snapshot + page
 // ---------------------------------------------------------------------------
@@ -998,10 +1026,8 @@ const server = http.createServer(async (req, res) => {
   if (body.length > 0) headers['content-length'] = Buffer.byteLength(body);
   else delete headers['content-length'];
 
-  const upstreamReq = https.request(
+  const upstreamReq = upstreamRequest(
     {
-      hostname: UPSTREAM_HOST,
-      port: 443,
       method: req.method,
       path: req.url,
       headers,
@@ -1041,11 +1067,14 @@ server.on('connection', (socket) => socket.setNoDelay(true));
 
 server.listen(PORT, HOST, () => {
   loadCredentials(); // warm the cache so we can report status at boot
-  console.log(`[proxy] listening on http://${HOST}:${PORT}`);
-  console.log(`[proxy] forwarding to https://${UPSTREAM_HOST}`);
+  const port = server.address().port; // bound port (PORT=0 picks a free one)
+  console.log(`[proxy] listening on http://${HOST}:${port}`);
+  console.log(
+    `[proxy] forwarding to ${UPSTREAM_PROTOCOL}://${UPSTREAM_HOST}:${UPSTREAM_PORT}`,
+  );
   console.log(`[proxy] shared-secret header: ${SECRET_HEADER}`);
   console.log(
-    `[proxy] dashboard: http://${HOST === '0.0.0.0' ? 'localhost' : HOST}:${PORT}/dashboard?secret=YOUR_SECRET`,
+    `[proxy] dashboard: http://${HOST === '0.0.0.0' ? 'localhost' : HOST}:${port}/dashboard?secret=YOUR_SECRET`,
   );
   if (ALLOWED_MODELS.length)
     console.log(`[proxy] model allowlist: ${ALLOWED_MODELS.join(', ')}`);
