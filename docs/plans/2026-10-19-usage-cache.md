@@ -69,7 +69,7 @@ before the task closes; a task marked `**Discuss:** yes` has its approach agreed
 
 ## Execution
 - **Implementer:** the `implementer` agent definition (Opus at medium).
-- **Validation:** `npm test` (= `node --test test/`), plus `node --check server.js`. Formatting
+- **Validation:** `npm test` (= `node --test test/*.test.js`), plus `node --check server.js`. Formatting
   follows the repo's prettier style (single quotes, trailing commas, 2 spaces); run
   `npx prettier --check server.js test` only if prettier is already available, never install it.
 - **Commits:** one per task, `type(scope): subject`, after Codex's review.
@@ -158,16 +158,19 @@ upstream 429s, upstream fetches) and the pause end time; the dashboard page show
 - [x] the page renders the counters and the pause end (or nothing when not paused)
 
 ### Task 4: Verify acceptance criteria
-- [ ] every story and every Done-when above holds
-- [ ] `npm test` green
-- [ ] manual check: local proxy against the fake or real upstream, `curl` twice →
+- [x] every story and every Done-when above holds
+- [x] `npm test` green
+- [x] manual check: local proxy against the fake or real upstream, `curl` twice →
       `x-proxy-cache: miss`, then `hit`
 
+Verified 2026-10-19: `npm test` 42/42; manual curl against a fake upstream → miss, then hit
+(`age: 1`); 401 without the secret; one upstream request with UA `claude-code/2.1.0`.
+
 ### Task 5: Update documentation
-- [ ] `README.md` describes the usage cache, its behavior and every new env variable
+- [x] `README.md` describes the usage cache, its behavior and every new env variable
       (`USAGE_*`, `UPSTREAM_PORT`, `UPSTREAM_PROTOCOL`), and `npm test`
-- [ ] `.env.example` lists the new variables with defaults
-- [ ] the dashboard note no longer claims nothing about limits is visible if that became wrong
+- [x] `.env.example` lists the new variables with defaults
+- [x] the dashboard note no longer claims nothing about limits is visible if that became wrong
 
 ## Post-Completion
 - Owner: how the proxy is deployed on `claude.sdfpro.ru` (systemd, docker, manual) — needed before

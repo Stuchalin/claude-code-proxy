@@ -1139,7 +1139,7 @@ a{color:#c8a2ff}
   </tr></thead><tbody id="models"></tbody></table>
   <p class="note">
     "Est. $" = what this traffic would cost at public per-token <em>API</em> prices — a usage yardstick, not a real charge (your subscription is a flat fee).
-    Account-level weekly/session limit % is not exposed by the Anthropic API, so it can't be shown here — check <span class="dim">/status</span> in your own CLI for that.
+    Account-level weekly/session limit % is not shown here: the proxy only caches the undocumented <span class="dim">/api/oauth/usage</span> answer for clients and does not read it — check <span class="dim">/status</span> in your own CLI for that.
     Stats reset when the proxy restarts.
   </p>
 </div>
